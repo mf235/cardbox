@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v11
+CardBox v12
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.1.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -2087,11 +2087,21 @@ class ImageViewerWindow(QWidget):
     }
     RESIZE_MARGIN = 8
 
-    def __init__(self, main_window: "MainWindow", image_path: Path, mode: str = MODE_FRAMELESS, external_image: bool = False):
+    def __init__(
+        self,
+        main_window: "MainWindow",
+        image_path: Path,
+        mode: str = MODE_FRAMELESS,
+        external_image: bool = False,
+        source_prompt_id: int | None = None,
+        source_image_id: int | None = None,
+    ):
         super().__init__()
         self.main_window = main_window
         self.image_path = image_path
         self.external_image = bool(external_image)
+        self.source_prompt_id = None if self.external_image else (int(source_prompt_id) if source_prompt_id is not None else None)
+        self.source_image_id = None if self.external_image else (int(source_image_id) if source_image_id is not None else None)
         self.pixmap = QPixmap(str(image_path))
         self.mode = mode if mode in self.MODE_LABELS else self.MODE_FRAMELESS
         self.zoom_percent = 100
@@ -2177,6 +2187,90 @@ class ImageViewerWindow(QWidget):
             return True
         return False
 
+    def is_card_navigation_available(self) -> bool:
+        return (not self.external_image) and self.source_prompt_id is not None and self.source_image_id is not None
+
+    def is_viewer_navigation_key(self, key: int, modifiers) -> int:
+        no_modifier = modifiers in (Qt.NoModifier, Qt.KeypadModifier)
+        alt_only = bool(modifiers & Qt.AltModifier) and not bool(modifiers & (Qt.ControlModifier | Qt.ShiftModifier | Qt.MetaModifier))
+        if no_modifier and key in (Qt.Key_Left, Qt.Key_Up):
+            return -1
+        if no_modifier and key in (Qt.Key_Right, Qt.Key_Down):
+            return 1
+        if alt_only and key == Qt.Key_Left:
+            return -1
+        if alt_only and key == Qt.Key_Right:
+            return 1
+        return 0
+
+    def handle_viewer_navigation_event(self, event) -> bool:
+        if not hasattr(event, "key") or not hasattr(event, "modifiers"):
+            return False
+        direction = self.is_viewer_navigation_key(event.key(), event.modifiers())
+        if direction == 0:
+            return False
+        if self.navigate_card_image(direction):
+            event.accept()
+            return True
+        return False
+
+    def navigate_card_image(self, direction: int) -> bool:
+        if not self.is_card_navigation_available():
+            return False
+        entries = self.main_window.card_image_navigation_entries(int(self.source_prompt_id))
+        if not entries:
+            return True
+
+        current_index = None
+        current_id = int(self.source_image_id) if self.source_image_id is not None else None
+        for index, (image_id, _path) in enumerate(entries):
+            if current_id is not None and int(image_id) == current_id:
+                current_index = index
+                break
+        if current_index is None:
+            current_key = material_path_key(self.image_path)
+            for index, (_image_id, path) in enumerate(entries):
+                if material_path_key(path) == current_key:
+                    current_index = index
+                    break
+        if current_index is None:
+            self.main_window.statusBar().showMessage("この画像の前後移動情報が見つかりません")
+            return True
+
+        target_index = current_index + (1 if direction > 0 else -1)
+        if target_index < 0 or target_index >= len(entries):
+            self.main_window.statusBar().showMessage("前の画像はありません" if direction < 0 else "次の画像はありません")
+            return True
+
+        target_image_id, target_path = entries[target_index]
+        if self.load_viewer_image(target_path, int(target_image_id)):
+            self.main_window.select_material_in_list_if_current_prompt(int(self.source_prompt_id), int(target_image_id))
+            self.main_window.statusBar().showMessage(f"画像ビュアー: {target_path.name}")
+        return True
+
+    def load_viewer_image(self, image_path: Path, image_id: int | None = None) -> bool:
+        if not image_path.exists():
+            self.main_window.statusBar().showMessage(f"画像ファイルが見つかりません: {image_path.name}")
+            return False
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            self.main_window.statusBar().showMessage(f"画像を表示できません: {image_path.name}")
+            return False
+        self.image_path = image_path
+        if image_id is not None:
+            self.source_image_id = int(image_id)
+        self.pixmap = pixmap
+        self.setWindowTitle(image_path.name)
+        self.offset = QPoint(0, 0)
+        self.clear_scaled_cache()
+        if self.mode == self.MODE_FRAMELESS:
+            self.resize_to_zoom()
+        else:
+            self.center_image_if_needed()
+        self.update_cursor(QPoint(self.width() // 2, self.height() // 2))
+        self.update()
+        return True
+
     def nativeEvent(self, eventType, message):  # noqa: N802 - Qt naming
         # Windows の Alt+キーは WM_SYSKEYDOWN として処理され、
         # メインウィンドウ最小化中は Qt の QAction / keyPressEvent まで
@@ -2192,16 +2286,24 @@ class ImageViewerWindow(QWidget):
                 VK_Z = 0x5A
                 VK_A = 0x41
                 VK_X = 0x58
+                VK_LEFT = 0x25
+                VK_RIGHT = 0x27
 
                 msg = wintypes.MSG.from_address(int(message))
                 if int(msg.message) in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     vk = int(msg.wParam)
-                    if vk in (VK_Z, VK_A, VK_X) and (ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000):
+                    alt_pressed = bool(ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+                    if vk in (VK_Z, VK_A, VK_X) and alt_pressed:
                         # lParam bit 30 = previous key state. 押しっぱなしリピートは無視。
                         if int(msg.lParam) & (1 << 30):
                             return True, 0
                         qt_key = {VK_Z: Qt.Key_Z, VK_A: Qt.Key_A, VK_X: Qt.Key_X}.get(vk)
                         if qt_key is not None and self.handle_image_viewer_shortcut_key(qt_key):
+                            return True, 0
+                    if vk in (VK_LEFT, VK_RIGHT) and alt_pressed and self.is_card_navigation_available():
+                        if int(msg.lParam) & (1 << 30):
+                            return True, 0
+                        if self.navigate_card_image(-1 if vk == VK_LEFT else 1):
                             return True, 0
             except Exception:
                 pass
@@ -2439,6 +2541,8 @@ class ImageViewerWindow(QWidget):
 
     def keyPressEvent(self, event):  # noqa: N802 - Qt naming
         if self.handle_image_viewer_shortcut_event(event):
+            return
+        if self.handle_viewer_navigation_event(event):
             return
         if event.key() == Qt.Key_Escape:
             self.close()
@@ -7248,6 +7352,27 @@ class MainWindow(QMainWindow):
             return
         reveal_path_in_file_manager(path)
 
+    def card_image_navigation_entries(self, prompt_id: int) -> list[tuple[int, Path]]:
+        entries: list[tuple[int, Path]] = []
+        for row in self.db.list_images(int(prompt_id)):
+            path = self.material_file_path_from_row(row)
+            if path.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
+                continue
+            if not path.exists():
+                continue
+            entries.append((int(row["id"]), path))
+        return entries
+
+    def select_material_in_list_if_current_prompt(self, prompt_id: int, image_id: int) -> None:
+        if self.current_prompt_id is None or int(self.current_prompt_id) != int(prompt_id):
+            return
+        for index in range(self.image_list.count()):
+            item = self.image_list.item(index)
+            if item is not None and int(item.data(Qt.UserRole)) == int(image_id):
+                self.image_list.setCurrentItem(item)
+                self.image_list.scrollToItem(item)
+                return
+
     def open_selected_image(self) -> None:
         image_id = self.selected_image_id()
         if image_id is None:
@@ -7257,7 +7382,7 @@ class MainWindow(QMainWindow):
             return
         path = self.material_file_path_from_row(row)
         if path.suffix.lower() in SUPPORTED_IMAGE_EXTS:
-            self.open_image_viewer(path)
+            self.open_image_viewer(path, source_prompt_id=int(row["prompt_id"]), source_image_id=int(image_id))
         else:
             open_path(path)
 
@@ -7285,11 +7410,24 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def open_image_viewer(self, path: Path, external_image: bool = False) -> None:
+    def open_image_viewer(
+        self,
+        path: Path,
+        external_image: bool = False,
+        source_prompt_id: int | None = None,
+        source_image_id: int | None = None,
+    ) -> None:
         if not path.exists():
             QMessageBox.warning(self, "画像表示エラー", "画像ファイルが見つかりません。")
             return
-        viewer = ImageViewerWindow(self, path, ImageViewerWindow.MODE_FRAMELESS, external_image=external_image)
+        viewer = ImageViewerWindow(
+            self,
+            path,
+            ImageViewerWindow.MODE_FRAMELESS,
+            external_image=external_image,
+            source_prompt_id=source_prompt_id,
+            source_image_id=source_image_id,
+        )
         self.image_viewers.append(viewer)
         viewer.show()
         self.force_activate_widget(viewer)
@@ -7302,11 +7440,20 @@ class MainWindow(QMainWindow):
         offset = QPoint(old_viewer.offset)
         image_path = old_viewer.image_path
         external_image = getattr(old_viewer, "external_image", False)
+        source_prompt_id = getattr(old_viewer, "source_prompt_id", None)
+        source_image_id = getattr(old_viewer, "source_image_id", None)
         if old_viewer in self.image_viewers:
             self.image_viewers.remove(old_viewer)
         old_viewer.close()
 
-        viewer = ImageViewerWindow(self, image_path, mode, external_image=external_image)
+        viewer = ImageViewerWindow(
+            self,
+            image_path,
+            mode,
+            external_image=external_image,
+            source_prompt_id=source_prompt_id,
+            source_image_id=source_image_id,
+        )
         viewer.zoom_percent = zoom_percent
         viewer.offset = offset
         if geometry.isValid():
@@ -7491,6 +7638,8 @@ class MainWindow(QMainWindow):
             ("カード 削除", "Del"),
             ("画像ビュアー 前面表示", "Alt+Z"),
             ("画像ビュアー 並べて表示", "Alt+A"),
+            ("画像ビュアー 前の画像", "Left / Up / Alt+Left"),
+            ("画像ビュアー 次の画像", "Right / Down / Alt+Right"),
             ("画像ビュアー 全て閉じる", "Alt+X"),
             ("画像ビュアー 閉じる", "Esc"),
         ]
