@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "cardbox"
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v1.2.1"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME

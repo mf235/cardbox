@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v15
+CardBox v16
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v1.2.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -4680,8 +4680,8 @@ class MainWindow(QMainWindow):
         self.refresh_tags()
         self.reload_preset_combo()
         self.refresh_prompt_list()
-        self.restore_splitter_sizes()
-        QTimer.singleShot(0, self.restore_splitter_sizes)
+        self.restore_workspace_layout_state()
+        QTimer.singleShot(0, self.restore_workspace_layout_state)
         self.statusBar().showMessage(f"ワークスペース: {self.workspace_combo.currentText()}")
 
     def open_workspace_manager(self) -> None:
@@ -4691,7 +4691,7 @@ class MainWindow(QMainWindow):
         self.current_workspace_id = self.db.current_workspace_id()
         self.refresh_workspace_selector()
         self.apply_workspace_settings()
-        self.restore_splitter_sizes()
+        self.restore_workspace_layout_state()
         self.refresh_tags()
         self.reload_preset_combo()
         self.refresh_prompt_list()
@@ -5550,10 +5550,7 @@ class MainWindow(QMainWindow):
                     self.setWindowState(self.windowState() | Qt.WindowMaximized)
             except Exception:
                 pass
-        self.restore_splitter_sizes()
-        for section in self.collapsible_sections:
-            collapsed = self.db.get_setting(section.state_key, "0") == "1"
-            section.set_collapsed(collapsed, emit_signal=False)
+        self.restore_workspace_layout_state()
 
     def default_left_splitter_sizes(self) -> list[int]:
         total = self.left_splitter.height() if hasattr(self, "left_splitter") else 0
@@ -5650,9 +5647,37 @@ class MainWindow(QMainWindow):
         sizes = self.load_left_splitter_sizes_setting() or self.default_left_splitter_sizes()
         self.left_splitter.setSizes(self.normalize_left_splitter_sizes(sizes))
 
+    def restore_collapsible_section_state(self) -> None:
+        state = self.workspace_splitter_ui_state()
+        collapsed_sections = state.get("collapsed_sections")
+        if not isinstance(collapsed_sections, dict):
+            collapsed_sections = {}
+        for section in self.collapsible_sections:
+            if section.state_key in collapsed_sections:
+                collapsed = bool(collapsed_sections.get(section.state_key))
+            else:
+                # v15以前のグローバル保存値は、ワークスペース側に保存値がない場合だけfallbackする。
+                collapsed = self.db.get_setting(section.state_key, "0") == "1"
+            section.set_collapsed(collapsed, emit_signal=False)
+
+    def restore_workspace_layout_state(self) -> None:
+        self.restore_collapsible_section_state()
+        self.restore_splitter_sizes()
+
     def schedule_startup_left_splitter_restore(self) -> None:
-        QTimer.singleShot(0, self.restore_splitter_sizes)
-        QTimer.singleShot(150, self.restore_splitter_sizes)
+        QTimer.singleShot(0, self.restore_workspace_layout_state)
+        QTimer.singleShot(150, self.restore_workspace_layout_state)
+
+    def current_collapsible_section_state(self) -> dict[str, bool]:
+        return {section.state_key: bool(section.is_collapsed()) for section in self.collapsible_sections}
+
+    def save_collapsible_section_state(self, workspace_id: int | None = None) -> None:
+        workspace_id = self.current_workspace_id if workspace_id is None else int(workspace_id)
+        if workspace_id is None:
+            return
+        state = self.db.get_workspace_ui_state(workspace_id)
+        state["collapsed_sections"] = self.current_collapsible_section_state()
+        self.db.set_workspace_ui_state(workspace_id, state)
 
     def save_splitter_sizes(self, workspace_id: int | None = None) -> None:
         if not all(hasattr(self, name) for name in ("main_splitter", "left_splitter", "text_splitter")):
@@ -5666,6 +5691,7 @@ class MainWindow(QMainWindow):
                 "main_splitter_sizes": [int(v) for v in self.main_splitter.sizes()],
                 "left_splitter_sizes_v3": [int(v) for v in self.left_splitter.sizes()],
                 "text_splitter_sizes": [int(v) for v in self.text_splitter.sizes()],
+                "collapsed_sections": self.current_collapsible_section_state(),
             }
         )
         self.db.set_workspace_ui_state(workspace_id, state)
@@ -5686,7 +5712,9 @@ class MainWindow(QMainWindow):
             self.db.set_setting(section.state_key, "1" if section.is_collapsed() else "0")
 
     def on_section_collapsed_changed(self, state_key: str, collapsed: bool) -> None:
-        self.db.set_setting(state_key, "1" if collapsed else "0")
+        self.save_collapsible_section_state()
+        # 折りたたみで各ペインの実サイズも変わるため、レイアウト反映後のスプリッター値も保存する。
+        QTimer.singleShot(0, self.save_splitter_sizes)
 
     def tag_color_for_name(self, tag_name: str) -> str:
         return self.tag_color_map.get(tag_name, self.db.get_effective_tag_color(tag_name))
