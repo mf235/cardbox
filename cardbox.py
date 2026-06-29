@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v17
+CardBox v18
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.3.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -4060,6 +4060,47 @@ class AssetBackupWorker(QObject):
             pass
         return self.base_dir / path
 
+    def prompt_registered_asset_rel_sets(self, conn: sqlite3.Connection, prompt_id: int, src_dir: Path) -> tuple[set[str], set[str]]:
+        media_rels: set[str] = set()
+        related_rels: set[str] = set()
+        rows = conn.execute(
+            "SELECT file_path, thumbnail_path FROM images WHERE prompt_id = ? ORDER BY id ASC",
+            (int(prompt_id),),
+        ).fetchall()
+        try:
+            src_resolved = src_dir.resolve()
+        except Exception:
+            src_resolved = src_dir
+        for row in rows:
+            file_path = self.stored_path_to_absolute(row["file_path"])
+            thumb_path = self.stored_path_to_absolute(row["thumbnail_path"])
+            for path, target_set in ((file_path, media_rels), (thumb_path, related_rels)):
+                if not path:
+                    continue
+                try:
+                    resolved = path.resolve()
+                    rel = resolved.relative_to(src_resolved).as_posix()
+                except Exception:
+                    continue
+                if rel:
+                    target_set.add(rel)
+        related_rels.difference_update(media_rels)
+        return media_rels, related_rels
+
+    def is_related_asset_rel(self, rel: str, media_rels: set[str] | None = None, related_rels: set[str] | None = None) -> bool:
+        rel = str(rel or "").replace("\\", "/").strip("/")
+        if not rel:
+            return True
+        if media_rels is not None and rel in media_rels:
+            return False
+        if related_rels is not None and rel in related_rels:
+            return True
+        parts = [part.lower() for part in rel.split("/") if part]
+        return "thumbnails" in parts or "thumbs" in parts
+
+    def result_count_key(self, prefix: str, is_related: bool) -> str:
+        return f"related_{prefix}" if is_related else prefix
+
     def update_prompt_file_stats(self, conn: sqlite3.Connection, prompt_id: int) -> None:
         rows = conn.execute("SELECT id, file_path FROM images WHERE prompt_id = ? ORDER BY id ASC", (int(prompt_id),)).fetchall()
         for row in rows:
@@ -4088,17 +4129,30 @@ class AssetBackupWorker(QObject):
             raise RuntimeError(f"コピー後のサイズが一致しません: {src}")
         return True
 
-    def mirror_prompt_dir(self, src_dir: Path, dest_dir: Path) -> tuple[int, int, int, list[str]]:
-        copied = 0
-        deleted = 0
-        skipped = 0
-        errors: list[str] = []
+    def mirror_prompt_dir(
+        self,
+        src_dir: Path,
+        dest_dir: Path,
+        media_rels: set[str],
+        related_rels: set[str],
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "copied": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "related_copied": 0,
+            "related_deleted": 0,
+            "related_skipped": 0,
+            "errors": [],
+        }
+        errors: list[str] = result["errors"]  # type: ignore[assignment]
         if not src_dir.exists():
             if dest_dir.exists():
                 moved, move_errors = move_paths_to_recycle_bin([dest_dir])
-                deleted += moved
+                result["deleted"] = int(result["deleted"]) + moved
                 errors.extend(move_errors)
-            return copied, deleted, skipped, errors
+            return result
 
         source_files: dict[str, Path] = {}
         for src in src_dir.rglob("*"):
@@ -4109,19 +4163,25 @@ class AssetBackupWorker(QObject):
                     continue
                 source_files[rel] = src
 
-        for rel, src in source_files.items():
+        source_items = list(source_files.items())
+        total_source = max(1, len(source_items))
+        for index, (rel, src) in enumerate(source_items, start=1):
             dest = dest_dir.joinpath(*PureWindowsPath(rel).parts)
+            is_related = self.is_related_asset_rel(rel, media_rels, related_rels)
             try:
                 if self.copy_file_if_needed(src, dest):
-                    copied += 1
+                    key = self.result_count_key("copied", is_related)
                 else:
-                    skipped += 1
+                    key = self.result_count_key("skipped", is_related)
+                result[key] = int(result[key]) + 1
             except Exception as exc:
                 errors.append(f"copy: {src} -> {dest}: {exc}")
+            if progress_callback is not None and (index == 1 or index == total_source or index % 25 == 0):
+                progress_callback(f"コピー確認中... {index}/{total_source} {src.name}")
 
         if dest_dir.exists():
             source_keys = set(source_files.keys())
-            extra_paths: list[Path] = []
+            extra_paths: list[tuple[str, Path]] = []
             for dest_child in dest_dir.rglob("*"):
                 if not dest_child.exists() or not dest_child.is_file():
                     continue
@@ -4130,19 +4190,35 @@ class AssetBackupWorker(QObject):
                 except Exception:
                     continue
                 if rel not in source_keys:
-                    extra_paths.append(dest_child)
-            extra_paths.sort(key=lambda p: len(p.parts), reverse=True)
-            if extra_paths:
-                moved, move_errors = move_paths_to_recycle_bin(extra_paths)
-                deleted += moved
+                    extra_paths.append((rel, dest_child))
+            extra_paths.sort(key=lambda item: len(item[1].parts), reverse=True)
+            total_extra = max(1, len(extra_paths))
+            for index, (rel, extra_path) in enumerate(extra_paths, start=1):
+                is_related = self.is_related_asset_rel(rel, media_rels, related_rels)
+                moved, move_errors = move_paths_to_recycle_bin([extra_path])
+                key = self.result_count_key("deleted", is_related)
+                result[key] = int(result[key]) + moved
                 errors.extend(move_errors)
+                if progress_callback is not None and (index == 1 or index == total_extra or index % 25 == 0):
+                    progress_callback(f"余分ファイル削除中... {index}/{total_extra} {extra_path.name}")
             remove_empty_dirs(dest_dir)
             if source_files:
                 dest_dir.mkdir(parents=True, exist_ok=True)
-        return copied, deleted, skipped, errors
+        return result
 
     def run(self) -> None:
-        result = {"copied": 0, "deleted": 0, "skipped": 0, "prompt_count": 0, "delete_count": 0, "errors": []}
+        result = {
+            "copied": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "related_copied": 0,
+            "related_deleted": 0,
+            "related_skipped": 0,
+            "prompt_count": 0,
+            "delete_count": 0,
+            "related_delete_count": 0,
+            "errors": [],
+        }
         conn: sqlite3.Connection | None = None
         try:
             self.progress.emit(1, "assetsバックアップを準備中...")
@@ -4163,13 +4239,19 @@ class AssetBackupWorker(QObject):
                 "SELECT id, relative_path, path_type FROM backup_delete_queue ORDER BY deleted_at ASC, id ASC"
             ).fetchall()
             result["prompt_count"] = len(prompt_rows)
-            result["delete_count"] = len(delete_rows)
+            for row in delete_rows:
+                rel = normalize_backup_relative_path(row["relative_path"])
+                if self.is_related_asset_rel(rel):
+                    result["related_delete_count"] += 1
+                else:
+                    result["delete_count"] += 1
             total_units = max(1, len(prompt_rows) + len(delete_rows))
             done_units = 0
             processed_delete_ids: list[int] = []
 
             for row in delete_rows:
                 rel = normalize_backup_relative_path(row["relative_path"])
+                is_related = self.is_related_asset_rel(rel)
                 if not rel:
                     processed_delete_ids.append(int(row["id"]))
                     done_units += 1
@@ -4178,7 +4260,8 @@ class AssetBackupWorker(QObject):
                 try:
                     if dest.exists():
                         moved, move_errors = move_paths_to_recycle_bin([dest])
-                        result["deleted"] += moved
+                        key = self.result_count_key("deleted", is_related)
+                        result[key] += moved
                         if move_errors:
                             result["errors"].extend(move_errors)
                         else:
@@ -4188,20 +4271,25 @@ class AssetBackupWorker(QObject):
                 except Exception as exc:
                     result["errors"].append(f"delete: {dest}: {exc}")
                 done_units += 1
-                self.progress.emit(int(done_units / total_units * 90) + 5, f"削除同期中... {done_units}/{total_units}")
+                self.progress.emit(int(done_units / total_units * 90) + 5, f"削除同期中... {done_units}/{len(delete_rows)} {Path(rel).name}")
 
             for row in prompt_rows:
                 prompt_id = int(row["id"])
                 src_dir = self.prompt_asset_dir_from_row(row)
                 dest_dir = self.mirror_target_for_source(src_dir)
+                base_progress = int(done_units / total_units * 90) + 5
+
+                def emit_file_progress(message: str, prompt_id: int = prompt_id, base_progress: int = base_progress) -> None:
+                    self.progress.emit(base_progress, f"prompt_{prompt_id:06d}: {message}")
+
                 if dest_dir is None:
                     result["errors"].append(f"mirror target error: {src_dir}")
                 else:
-                    c, d, sk, errs = self.mirror_prompt_dir(src_dir, dest_dir)
-                    result["copied"] += c
-                    result["deleted"] += d
-                    result["skipped"] += sk
-                    result["errors"].extend(errs)
+                    media_rels, related_rels = self.prompt_registered_asset_rel_sets(conn, prompt_id, src_dir)
+                    prompt_result = self.mirror_prompt_dir(src_dir, dest_dir, media_rels, related_rels, emit_file_progress)
+                    for key in ("copied", "deleted", "skipped", "related_copied", "related_deleted", "related_skipped"):
+                        result[key] += int(prompt_result.get(key, 0))
+                    result["errors"].extend(list(prompt_result.get("errors", [])))
                     self.update_prompt_file_stats(conn, prompt_id)
                 done_units += 1
                 self.progress.emit(int(done_units / total_units * 90) + 5, f"カードassets同期中... prompt_{prompt_id:06d} ({done_units}/{total_units})")
@@ -4499,6 +4587,10 @@ class MainWindow(QMainWindow):
         progress = QProgressDialog("assetsバックアップを実行中...", "", 0, 100, self)
         progress.setWindowTitle("assetsバックアップ")
         progress.setCancelButton(None)
+        try:
+            progress.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        except Exception:
+            pass
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
@@ -4542,9 +4634,25 @@ class MainWindow(QMainWindow):
         copied = int(info.get("copied", 0)) if isinstance(info, dict) else 0
         deleted = int(info.get("deleted", 0)) if isinstance(info, dict) else 0
         skipped = int(info.get("skipped", 0)) if isinstance(info, dict) else 0
+        related_copied = int(info.get("related_copied", 0)) if isinstance(info, dict) else 0
+        related_deleted = int(info.get("related_deleted", 0)) if isinstance(info, dict) else 0
+        related_skipped = int(info.get("related_skipped", 0)) if isinstance(info, dict) else 0
         prompts = int(info.get("prompt_count", 0)) if isinstance(info, dict) else 0
         deletes = int(info.get("delete_count", 0)) if isinstance(info, dict) else 0
-        summary = f"対象カード: {prompts} 件\n削除同期: {deletes} 件\nコピー/更新: {copied} 件\n削除: {deleted} 件\nスキップ: {skipped} 件"
+        related_deletes = int(info.get("related_delete_count", 0)) if isinstance(info, dict) else 0
+
+        def count_line(label: str, main_count: int, related_count: int) -> str:
+            if related_count:
+                return f"{label}: {main_count} 件（関連ファイル: {related_count} 件）"
+            return f"{label}: {main_count} 件"
+
+        summary = "\n".join([
+            f"対象カード: {prompts} 件",
+            count_line("削除同期", deletes, related_deletes),
+            count_line("コピー/更新", copied, related_copied),
+            count_line("削除", deleted, related_deleted),
+            count_line("スキップ", skipped, related_skipped),
+        ])
         if success:
             QMessageBox.information(self, "assetsバックアップ", f"{message}\n\n{summary}")
             self.statusBar().showMessage(f"assetsバックアップ完了: コピー/更新 {copied} 件、削除 {deleted} 件")
