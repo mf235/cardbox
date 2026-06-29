@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v14
+CardBox v15
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.1.2"
+APP_VERSION = "v1.2.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -111,6 +111,27 @@ def normalize_prompt_sort_mode(value: str) -> str:
     if value in PROMPT_SORT_LABELS:
         return value
     return DEFAULT_PROMPT_SORT_MODE
+
+
+def current_asset_bucket() -> str:
+    return datetime.now().strftime("%Y%m")
+
+
+def normalize_asset_bucket(value: object) -> str:
+    raw = str(value or "").replace("\\", "/").strip().strip("/")
+    if not raw:
+        return ""
+    parts = []
+    for part in raw.split("/"):
+        part = part.strip()
+        if not part or part in {".", ".."}:
+            return ""
+        # asset_bucket はアプリ内部の相対バケット名。
+        # パス区切り以外は安全なASCIIだけにして、将来 YYYYMM/000 のように拡張できる形にする。
+        if not re.fullmatch(r"[0-9A-Za-z_-]+", part):
+            return ""
+        parts.append(part)
+    return "/".join(parts)
 
 
 def supported_media_formats_text() -> str:
@@ -287,6 +308,7 @@ class Database:
                 text_field_1_label TEXT NOT NULL DEFAULT 'プロンプト',
                 text_field_2_label TEXT NOT NULL DEFAULT 'ネガティブ / 補助プロンプト',
                 text_field_3_label TEXT NOT NULL DEFAULT '説明 / メモ',
+                ui_state_json TEXT NOT NULL DEFAULT '{}',
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -310,14 +332,17 @@ class Database:
                 favorite INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 parent_prompt_id INTEGER,
+                asset_bucket TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(parent_prompt_id) REFERENCES prompts(id) ON DELETE SET NULL
             )
             """
         )
+        self.ensure_column("workspaces", "ui_state_json", "TEXT NOT NULL DEFAULT '{}'")
         self.ensure_column("prompts", "pinned", "INTEGER NOT NULL DEFAULT 0")
         self.ensure_column("prompts", "workspace_id", "INTEGER NOT NULL DEFAULT 1")
+        self.ensure_column("prompts", "asset_bucket", "TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS tag_categories (
@@ -617,6 +642,32 @@ class Database:
         )
         self.conn.commit()
 
+    def get_workspace_ui_state(self, workspace_id: int | None) -> dict:
+        row = self.get_workspace(workspace_id)
+        if row is None or "ui_state_json" not in row.keys():
+            return {}
+        try:
+            data = json.loads(str(row["ui_state_json"] or "{}"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def set_workspace_ui_state(self, workspace_id: int | None, data: dict) -> None:
+        if workspace_id is None:
+            return
+        payload = json.dumps(data if isinstance(data, dict) else {}, ensure_ascii=False)
+        self.conn.execute("UPDATE workspaces SET ui_state_json = ? WHERE id = ?", (payload, int(workspace_id)))
+        self.conn.commit()
+
+    def prompt_asset_bucket(self, prompt_id: int) -> str:
+        try:
+            row = self.conn.execute("SELECT asset_bucket FROM prompts WHERE id = ?", (int(prompt_id),)).fetchone()
+        except sqlite3.OperationalError:
+            return ""
+        if not row:
+            return ""
+        return normalize_asset_bucket(row["asset_bucket"] if "asset_bucket" in row.keys() else "")
+
     def seed_defaults_if_needed(self) -> None:
         """Seed default tags only for a brand-new database.
 
@@ -840,12 +891,13 @@ class Database:
         now = self.now()
         workspace_id = self.current_workspace_id() if workspace_id is None else int(workspace_id)
         cur = self.conn.cursor()
+        asset_bucket = current_asset_bucket()
         cur.execute(
             """
-            INSERT INTO prompts(workspace_id, title, prompt, negative_prompt, description, engine, model, project, rating, favorite, pinned, parent_prompt_id, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO prompts(workspace_id, title, prompt, negative_prompt, description, engine, model, project, rating, favorite, pinned, parent_prompt_id, asset_bucket, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (workspace_id, title, prompt, negative_prompt, description, engine, model, project, rating, favorite, pinned, parent_prompt_id, now, now),
+            (workspace_id, title, prompt, negative_prompt, description, engine, model, project, rating, favorite, pinned, parent_prompt_id, asset_bucket, now, now),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -4356,7 +4408,23 @@ class MainWindow(QMainWindow):
                 pass
 
     def prompt_asset_dir(self, prompt_id: int) -> Path:
-        return self.assets_dir / f"prompt_{prompt_id:06d}"
+        bucket = self.db.prompt_asset_bucket(prompt_id) if hasattr(self, "db") else ""
+        prompt_folder = f"prompt_{int(prompt_id):06d}"
+        if bucket:
+            return self.assets_dir.joinpath(*bucket.split("/")) / prompt_folder
+        return self.assets_dir / prompt_folder
+
+    def cleanup_empty_asset_parents_for_path(self, prompt_dir: Path) -> None:
+        try:
+            current = Path(prompt_dir).parent
+            while current != self.assets_dir and is_relative_to_path(current, self.assets_dir):
+                try:
+                    current.rmdir()
+                except OSError:
+                    break
+                current = current.parent
+        except Exception:
+            pass
 
     def prompt_images_dir(self, prompt_id: int) -> Path:
         return self.prompt_asset_dir(prompt_id) / "images"
@@ -4594,6 +4662,7 @@ class MainWindow(QMainWindow):
         if not self.maybe_save_dirty():
             self.refresh_workspace_selector()
             return
+        self.save_splitter_sizes(old_workspace_id)
         try:
             self.db.set_current_workspace_id(int(workspace_id))
             self.current_workspace_id = int(workspace_id)
@@ -4611,14 +4680,18 @@ class MainWindow(QMainWindow):
         self.refresh_tags()
         self.reload_preset_combo()
         self.refresh_prompt_list()
+        self.restore_splitter_sizes()
+        QTimer.singleShot(0, self.restore_splitter_sizes)
         self.statusBar().showMessage(f"ワークスペース: {self.workspace_combo.currentText()}")
 
     def open_workspace_manager(self) -> None:
+        self.save_splitter_sizes()
         dialog = WorkspaceManagerDialog(self.db, self)
         dialog.exec()
         self.current_workspace_id = self.db.current_workspace_id()
         self.refresh_workspace_selector()
         self.apply_workspace_settings()
+        self.restore_splitter_sizes()
         self.refresh_tags()
         self.reload_preset_combo()
         self.refresh_prompt_list()
@@ -5490,23 +5563,39 @@ class MainWindow(QMainWindow):
         bottom_height = max(LEFT_PROMPT_LIST_MIN_HEIGHT, total - tag_height)
         return [tag_height, bottom_height]
 
+    def parse_splitter_size_values(self, value: object) -> list[int] | None:
+        if value is None or value == "":
+            return None
+        try:
+            data = json.loads(value) if isinstance(value, str) else value
+            if isinstance(data, list):
+                values = [max(0, int(v)) for v in data]
+                if values and sum(values) > 0:
+                    return values
+        except Exception:
+            return None
+        return None
+
+    def workspace_splitter_ui_state(self, workspace_id: int | None = None) -> dict:
+        workspace_id = self.current_workspace_id if workspace_id is None else int(workspace_id)
+        return self.db.get_workspace_ui_state(workspace_id)
+
+    def splitter_sizes_from_workspace_or_global(self, key: str) -> list[int] | None:
+        state = self.workspace_splitter_ui_state()
+        values = self.parse_splitter_size_values(state.get(key))
+        if values is not None:
+            return values
+        return self.parse_splitter_size_values(self.db.get_setting(key, ""))
+
     def load_left_splitter_sizes_setting(self) -> list[int] | None:
         # v90以降は、ピン留めをsplitterの一要素にせず、
         # 「タグ絞り込み」と「ピン留め+カード一覧」の2分割だけを保存する。
-        raw = self.db.get_setting("left_splitter_sizes_v3", "")
-        if raw:
-            try:
-                sizes = json.loads(raw)
-                if isinstance(sizes, list) and len(sizes) >= 2:
-                    values = [max(0, int(v)) for v in sizes[:2]]
-                    if sum(values) > 0:
-                        return values
-            except Exception:
-                pass
+        values = self.splitter_sizes_from_workspace_or_global("left_splitter_sizes_v3")
+        if values and len(values) >= 2:
+            return values[:2]
 
         # v88〜v90で壊れた高さが left_splitter_sizes / left_splitter_sizes_v2 に
         # 保存されていることがあるため、自動復元には使わない。
-        # v91以降の終了時サイズだけを left_splitter_sizes_v3 として保存・復元する。
         return None
 
     def normalize_left_splitter_sizes(self, sizes: list[int]) -> list[int]:
@@ -5533,28 +5622,26 @@ class MainWindow(QMainWindow):
                     values[0] -= min(overflow, values[0] - LEFT_TAG_FILTER_MIN_HEIGHT)
         return values
 
+    def normalize_text_splitter_sizes(self, sizes: list[int]) -> list[int]:
+        pane_count = self.text_splitter.count()
+        values = list(sizes)
+        if len(values) == 3 and pane_count == 4:
+            values.append(340)
+        elif len(values) != pane_count:
+            values = values[:pane_count]
+            while len(values) < pane_count:
+                values.append(160)
+        return [max(0, int(v)) for v in values]
+
     def restore_splitter_sizes(self) -> None:
-        for key, splitter in [
-            ("main_splitter_sizes", self.main_splitter),
-            ("text_splitter_sizes", self.text_splitter),
-        ]:
-            raw = self.db.get_setting(key, "")
-            if not raw:
-                continue
-            try:
-                sizes = json.loads(raw)
-                if isinstance(sizes, list) and all(isinstance(v, int) for v in sizes):
-                    if key == "text_splitter_sizes":
-                        pane_count = splitter.count()
-                        if len(sizes) == 3 and pane_count == 4:
-                            sizes = list(sizes) + [340]
-                        elif len(sizes) != pane_count:
-                            sizes = list(sizes[:pane_count])
-                            while len(sizes) < pane_count:
-                                sizes.append(160)
-                    splitter.setSizes(sizes)
-            except Exception:
-                pass
+        main_sizes = self.splitter_sizes_from_workspace_or_global("main_splitter_sizes")
+        if main_sizes:
+            self.main_splitter.setSizes(main_sizes[: self.main_splitter.count()])
+
+        text_sizes = self.splitter_sizes_from_workspace_or_global("text_splitter_sizes")
+        if text_sizes:
+            self.text_splitter.setSizes(self.normalize_text_splitter_sizes(text_sizes))
+
         self.restore_left_splitter_sizes()
 
     def restore_left_splitter_sizes(self) -> None:
@@ -5564,13 +5651,24 @@ class MainWindow(QMainWindow):
         self.left_splitter.setSizes(self.normalize_left_splitter_sizes(sizes))
 
     def schedule_startup_left_splitter_restore(self) -> None:
-        QTimer.singleShot(0, self.restore_left_splitter_sizes)
-        QTimer.singleShot(150, self.restore_left_splitter_sizes)
+        QTimer.singleShot(0, self.restore_splitter_sizes)
+        QTimer.singleShot(150, self.restore_splitter_sizes)
 
-    def save_splitter_sizes(self) -> None:
-        self.db.set_setting("main_splitter_sizes", json.dumps(self.main_splitter.sizes()))
-        self.db.set_setting("left_splitter_sizes_v3", json.dumps(self.left_splitter.sizes()))
-        self.db.set_setting("text_splitter_sizes", json.dumps(self.text_splitter.sizes()))
+    def save_splitter_sizes(self, workspace_id: int | None = None) -> None:
+        if not all(hasattr(self, name) for name in ("main_splitter", "left_splitter", "text_splitter")):
+            return
+        workspace_id = self.current_workspace_id if workspace_id is None else int(workspace_id)
+        if workspace_id is None:
+            return
+        state = self.db.get_workspace_ui_state(workspace_id)
+        state.update(
+            {
+                "main_splitter_sizes": [int(v) for v in self.main_splitter.sizes()],
+                "left_splitter_sizes_v3": [int(v) for v in self.left_splitter.sizes()],
+                "text_splitter_sizes": [int(v) for v in self.text_splitter.sizes()],
+            }
+        )
+        self.db.set_workspace_ui_state(workspace_id, state)
 
     def save_ui_state(self) -> None:
         geom = self.normalGeometry() if self.isMaximized() else self.geometry()
@@ -6167,6 +6265,7 @@ class MainWindow(QMainWindow):
 
         self.db.delete_prompt(deleted_id)
         moved, errors = move_paths_to_recycle_bin(recycle_targets)
+        self.cleanup_empty_asset_parents_for_path(prompt_asset_dir)
         self.clear_detail()
         self.refresh_tags()
         self.refresh_prompt_list()
@@ -6401,7 +6500,9 @@ class MainWindow(QMainWindow):
                         old_thumb_path.unlink()
                     except Exception:
                         pass
-                remove_empty_dirs(self.prompt_asset_dir(source_prompt_id))
+                source_prompt_asset_dir = self.prompt_asset_dir(source_prompt_id)
+                remove_empty_dirs(source_prompt_asset_dir)
+                self.cleanup_empty_asset_parents_for_path(source_prompt_asset_dir)
                 message = "メディアを移動しました"
         except Exception as exc:
             QMessageBox.warning(self, "メディアD&Dエラー", f"メディアを{'コピー' if copy_mode else '移動'}できませんでした。\n\n{exc}")
@@ -7247,6 +7348,7 @@ class MainWindow(QMainWindow):
                 recycle_targets = [prompt_asset_dir]
         moved, errors = move_paths_to_recycle_bin(recycle_targets)
         remove_empty_dirs(prompt_asset_dir)
+        self.cleanup_empty_asset_parents_for_path(prompt_asset_dir)
         self.refresh_images()
         self.update_prompt_rows_in_visible_list_in_place(prompt_id)
         if errors:
