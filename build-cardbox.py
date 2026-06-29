@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "cardbox"
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.1.1"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
@@ -193,14 +193,99 @@ def create_launcher_multisize_icon() -> Path:
 def write_launcher_resource(icon_path: Path) -> Path:
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     icon_text = str(icon_path.resolve()).replace("\\", "\\\\")
-    LAUNCHER_GENERATED_RESOURCE.write_text(f'IDI_ICON1 ICON "{icon_text}"\n', encoding="utf-8")
+    LAUNCHER_GENERATED_RESOURCE.write_text(f'1 ICON "{icon_text}"\n', encoding="utf-8")
     return LAUNCHER_GENERATED_RESOURCE
 
 
-def build_launcher() -> None:
+def _read_u16(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 2], "little")
+
+
+def _read_u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 4], "little")
+
+
+def _pe_rva_to_offset(rva: int, sections: list[tuple[int, int, int, int]]) -> int | None:
+    for virtual_address, virtual_size, raw_pointer, raw_size in sections:
+        span = max(virtual_size, raw_size)
+        if virtual_address <= rva < virtual_address + span:
+            return raw_pointer + (rva - virtual_address)
+    return None
+
+
+def launcher_has_icon_resource(exe_path: Path) -> bool:
+    """Return True if the launcher EXE contains an icon resource group.
+
+    This is intentionally small and dependency-free. It only checks the PE resource
+    table for RT_ICON or RT_GROUP_ICON so an iconless launcher build fails instead
+    of silently producing a Windows default icon.
+    """
+    try:
+        data = exe_path.read_bytes()
+        if len(data) < 0x100 or data[:2] != b"MZ":
+            return False
+        pe_offset = _read_u32(data, 0x3C)
+        if data[pe_offset:pe_offset + 4] != b"PE\0\0":
+            return False
+        coff_offset = pe_offset + 4
+        section_count = _read_u16(data, coff_offset + 2)
+        optional_size = _read_u16(data, coff_offset + 16)
+        optional_offset = coff_offset + 20
+        magic = _read_u16(data, optional_offset)
+        if magic == 0x10B:
+            data_dir_offset = optional_offset + 96
+        elif magic == 0x20B:
+            data_dir_offset = optional_offset + 112
+        else:
+            return False
+        resource_rva = _read_u32(data, data_dir_offset + 8 * 2)
+        if resource_rva == 0:
+            return False
+        section_offset = optional_offset + optional_size
+        sections: list[tuple[int, int, int, int]] = []
+        for i in range(section_count):
+            base = section_offset + i * 40
+            virtual_size = _read_u32(data, base + 8)
+            virtual_address = _read_u32(data, base + 12)
+            raw_size = _read_u32(data, base + 16)
+            raw_pointer = _read_u32(data, base + 20)
+            sections.append((virtual_address, virtual_size, raw_pointer, raw_size))
+        resource_offset = _pe_rva_to_offset(resource_rva, sections)
+        if resource_offset is None:
+            return False
+        named_count = _read_u16(data, resource_offset + 12)
+        id_count = _read_u16(data, resource_offset + 14)
+        entry_count = named_count + id_count
+        for i in range(entry_count):
+            entry = resource_offset + 16 + i * 8
+            name_value = _read_u32(data, entry)
+            if name_value & 0x80000000:
+                continue
+            resource_type_id = name_value & 0xFFFF
+            if resource_type_id in (3, 14):  # RT_ICON / RT_GROUP_ICON
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _compile_launcher_resource_with_rc(rc_exe: str, launcher_resource: Path, launcher_res: Path) -> Path:
+    result = subprocess.run([rc_exe, "/nologo", f"/fo{launcher_res}", str(launcher_resource)])
+    if result.returncode != 0 or not launcher_res.exists():
+        fail("Launcher icon resource compile failed with rc.exe. cardbox-open.exe was not created.")
+    return launcher_res
+
+
+def _compile_launcher_resource_with_windres(windres_exe: str, launcher_resource: Path, launcher_res_obj: Path) -> Path:
+    result = subprocess.run([windres_exe, str(launcher_resource), str(launcher_res_obj)])
+    if result.returncode != 0 or not launcher_res_obj.exists():
+        fail("Launcher icon resource compile failed with windres. cardbox-open.exe was not created.")
+    return launcher_res_obj
+
+
+def build_launcher(copy_to_root: bool = False) -> None:
     if not LAUNCHER_SOURCE.exists():
-        log(f"[INFO] Launcher source was not found, skipping: {LAUNCHER_SOURCE.name}")
-        return
+        fail(f"Launcher source was not found: {LAUNCHER_SOURCE.name}")
 
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     launcher_exe = DIST_DIR / LAUNCHER_EXE_NAME
@@ -213,16 +298,8 @@ def build_launcher() -> None:
     launcher_icon = create_launcher_multisize_icon()
     launcher_resource = write_launcher_resource(launcher_icon)
 
-    if compiler_cl:
-        resource_arg: list[str] = []
-        if launcher_resource.exists() and rc_exe:
-            rc_result = subprocess.run([rc_exe, "/nologo", f"/fo{launcher_res}", str(launcher_resource)])
-            if rc_result.returncode == 0 and launcher_res.exists():
-                resource_arg = [str(launcher_res)]
-            else:
-                log("[WARN] Launcher resource compile failed. Launcher icon may be missing.")
-        elif launcher_resource.exists():
-            log("[WARN] rc.exe was not found. Launcher icon may be missing.")
+    if compiler_cl and rc_exe:
+        resource_file = _compile_launcher_resource_with_rc(rc_exe, launcher_resource, launcher_res)
         command = [
             compiler_cl,
             "/nologo",
@@ -231,22 +308,14 @@ def build_launcher() -> None:
             "/D_UNICODE",
             f"/Fe:{launcher_exe}",
             str(LAUNCHER_SOURCE),
-            *resource_arg,
+            str(resource_file),
             "shell32.lib",
             "user32.lib",
             "/link",
             "/SUBSYSTEM:WINDOWS",
         ]
-    elif compiler_gcc:
-        resource_arg = []
-        if launcher_resource.exists() and windres_exe:
-            rc_result = subprocess.run([windres_exe, str(launcher_resource), str(launcher_res_obj)])
-            if rc_result.returncode == 0 and launcher_res_obj.exists():
-                resource_arg = [str(launcher_res_obj)]
-            else:
-                log("[WARN] Launcher resource compile failed. Launcher icon may be missing.")
-        elif launcher_resource.exists():
-            log("[WARN] windres was not found. Launcher icon may be missing.")
+    elif compiler_gcc and windres_exe:
+        resource_file = _compile_launcher_resource_with_windres(windres_exe, launcher_resource, launcher_res_obj)
         command = [
             compiler_gcc,
             "-O2",
@@ -255,19 +324,27 @@ def build_launcher() -> None:
             "-o",
             str(launcher_exe),
             str(LAUNCHER_SOURCE),
-            *resource_arg,
+            str(resource_file),
             "-lshell32",
             "-luser32",
         ]
     else:
-        log("[WARN] cl/gcc was not found. Launcher EXE will not be included in the release ZIP.")
-        log("[WARN] You can build it manually with build-cardbox-open.bat.")
-        return
+        fail(
+            "Launcher build needs either cl + rc or gcc + windres so cardbox-open.exe can include the app icon. "
+            "Install Visual Studio Build Tools with Windows SDK or MinGW-w64 with windres."
+        )
 
-    log("[INFO] Building lightweight launcher...")
+    log("[INFO] Building lightweight launcher with icon resource...")
     result = subprocess.run(command)
     if result.returncode != 0 or not launcher_exe.exists():
-        log("[WARN] Launcher build failed. Release ZIP will continue without cardbox-open.exe.")
+        fail("Launcher build failed. cardbox-open.exe was not created.")
+    if not launcher_has_icon_resource(launcher_exe):
+        fail("Launcher EXE was created without an icon resource. Build stopped.")
+    log(f"[INFO] Launcher icon resource verified: {launcher_exe}")
+
+    if copy_to_root:
+        shutil.copy2(launcher_exe, LAUNCHER_ROOT_EXE)
+        log(f"[INFO] Launcher copied: {LAUNCHER_ROOT_EXE}")
 
 
 def copy_release_text_files() -> None:
@@ -312,6 +389,35 @@ def clean_generated_build_files_after_zip() -> None:
         LAUNCHER_ROOT_RES_OBJ,
     ]:
         remove_path(path)
+
+
+def main_launcher_only() -> int:
+    os.chdir(ROOT_DIR)
+    log("")
+    log("========================================")
+    log("CardBox launcher build")
+    log("========================================")
+    log("")
+    if not EXE_ICON.exists():
+        fail(f"EXE icon was not found: {EXE_ICON}")
+    if not RESOURCES_DIR.exists():
+        fail(f"Resources folder was not found: {RESOURCES_DIR}")
+    log(f"[INFO] Launcher icon source: {EXE_ICON}")
+    log(f"[INFO] Launcher icon SHA256: {sha256(EXE_ICON)}")
+    for path in [
+        DIST_DIR,
+        LAUNCHER_ROOT_EXE,
+        LAUNCHER_ROOT_RES,
+        LAUNCHER_ROOT_RES_OBJ,
+    ]:
+        remove_path(path)
+    build_launcher(copy_to_root=True)
+    log("")
+    log("========================================")
+    log("Launcher build complete")
+    log("========================================")
+    log(f"EXE: {LAUNCHER_ROOT_EXE}")
+    return 0
 
 
 def main() -> int:
@@ -388,4 +494,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--launcher-only" in sys.argv:
+        raise SystemExit(main_launcher_only())
     raise SystemExit(main())
