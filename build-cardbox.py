@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 import shutil
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "cardbox"
-APP_VERSION = "v1.1.1"
+APP_VERSION = "v1.1.2"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
@@ -185,16 +186,61 @@ def ensure_optional_pillow() -> bool:
         return False
 
 
-def create_launcher_multisize_icon() -> Path:
+def create_launcher_multisize_icon(output_path: Path | None = None) -> Path:
     """Create a multi-size ICO for cardbox-open.exe."""
-    return create_multisize_icon(LAUNCHER_GENERATED_ICON, "Launcher")
+    return create_multisize_icon(output_path or LAUNCHER_GENERATED_ICON, "Launcher")
 
 
-def write_launcher_resource(icon_path: Path) -> Path:
-    DIST_DIR.mkdir(parents=True, exist_ok=True)
-    icon_text = str(icon_path.resolve()).replace("\\", "\\\\")
-    LAUNCHER_GENERATED_RESOURCE.write_text(f'1 ICON "{icon_text}"\n', encoding="utf-8")
-    return LAUNCHER_GENERATED_RESOURCE
+def write_launcher_resource(icon_path: Path, resource_path: Path | None = None, *, relative: bool = False) -> Path:
+    resource_path = resource_path or LAUNCHER_GENERATED_RESOURCE
+    resource_path.parent.mkdir(parents=True, exist_ok=True)
+    if relative:
+        icon_text = icon_path.name
+    else:
+        icon_text = str(icon_path.resolve()).replace("\\", "\\\\")
+    resource_path.write_text(f'1 ICON "{icon_text}"\n', encoding="utf-8")
+    return resource_path
+
+
+def _path_is_ascii(path: Path) -> bool:
+    try:
+        str(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def create_ascii_temp_dir(prefix: str) -> Path:
+    """Create an ASCII-only temp folder for MinGW windres/gcc.
+
+    Some MinGW windres builds still mangle Japanese paths in .rc icon
+    references. Keep the launcher source, icon, rc, resource object and exe in
+    an ASCII temp folder, then copy the finished exe back to dist.
+    """
+    candidates: list[Path] = []
+    override = os.environ.get("CARDBOX_ASCII_BUILD_DIR")
+    if override:
+        candidates.append(Path(override))
+    if os.name == "nt":
+        system_drive = os.environ.get("SystemDrive", "C:")
+        candidates.extend([Path(system_drive + "\\cardbox-build-temp"), Path(system_drive + "\\Temp")])
+    candidates.append(Path(tempfile.gettempdir()))
+    candidates.append(ROOT_DIR / "build-temp")
+
+    for parent in candidates:
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            temp_path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+            if _path_is_ascii(temp_path):
+                return temp_path
+            shutil.rmtree(temp_path, ignore_errors=True)
+        except Exception:
+            continue
+    fail(
+        "Launcher build needs an ASCII-only temporary folder because windres cannot read Japanese paths. "
+        "Set CARDBOX_ASCII_BUILD_DIR to an ASCII path such as C:\\Temp and run the build again."
+    )
+    raise AssertionError("unreachable")
 
 
 def _read_u16(data: bytes, offset: int) -> int:
@@ -293,54 +339,73 @@ def build_launcher(copy_to_root: bool = False) -> None:
     compiler_gcc = shutil.which("gcc")
     rc_exe = shutil.which("rc")
     windres_exe = shutil.which("windres")
-    launcher_res = DIST_DIR / "cardbox-open.res"
-    launcher_res_obj = DIST_DIR / "cardbox-open-resource.o"
-    launcher_icon = create_launcher_multisize_icon()
-    launcher_resource = write_launcher_resource(launcher_icon)
 
-    if compiler_cl and rc_exe:
-        resource_file = _compile_launcher_resource_with_rc(rc_exe, launcher_resource, launcher_res)
-        command = [
-            compiler_cl,
-            "/nologo",
-            "/O2",
-            "/DUNICODE",
-            "/D_UNICODE",
-            f"/Fe:{launcher_exe}",
-            str(LAUNCHER_SOURCE),
-            str(resource_file),
-            "shell32.lib",
-            "user32.lib",
-            "/link",
-            "/SUBSYSTEM:WINDOWS",
-        ]
-    elif compiler_gcc and windres_exe:
-        resource_file = _compile_launcher_resource_with_windres(windres_exe, launcher_resource, launcher_res_obj)
-        command = [
-            compiler_gcc,
-            "-O2",
-            "-municode",
-            "-mwindows",
-            "-o",
-            str(launcher_exe),
-            str(LAUNCHER_SOURCE),
-            str(resource_file),
-            "-lshell32",
-            "-luser32",
-        ]
-    else:
+    if not ((compiler_cl and rc_exe) or (compiler_gcc and windres_exe)):
         fail(
             "Launcher build needs either cl + rc or gcc + windres so cardbox-open.exe can include the app icon. "
             "Install Visual Studio Build Tools with Windows SDK or MinGW-w64 with windres."
         )
 
-    log("[INFO] Building lightweight launcher with icon resource...")
-    result = subprocess.run(command)
-    if result.returncode != 0 or not launcher_exe.exists():
-        fail("Launcher build failed. cardbox-open.exe was not created.")
-    if not launcher_has_icon_resource(launcher_exe):
-        fail("Launcher EXE was created without an icon resource. Build stopped.")
-    log(f"[INFO] Launcher icon resource verified: {launcher_exe}")
+    temp_dir = create_ascii_temp_dir("cardbox_launcher_")
+    try:
+        temp_source = temp_dir / LAUNCHER_SOURCE.name
+        temp_icon = temp_dir / "cardbox-open.ico"
+        temp_rc = temp_dir / "cardbox-open.rc"
+        temp_res = temp_dir / "cardbox-open.res"
+        temp_res_obj = temp_dir / "cardbox-open-resource.o"
+        temp_exe = temp_dir / LAUNCHER_EXE_NAME
+
+        shutil.copy2(LAUNCHER_SOURCE, temp_source)
+        launcher_icon = create_launcher_multisize_icon(temp_icon)
+        if launcher_icon.resolve() != temp_icon.resolve():
+            shutil.copy2(launcher_icon, temp_icon)
+        write_launcher_resource(temp_icon, temp_rc, relative=True)
+
+        log(f"[INFO] Launcher build temp: {temp_dir}")
+
+        if compiler_cl and rc_exe:
+            resource_file = _compile_launcher_resource_with_rc(rc_exe, temp_rc, temp_res)
+            command = [
+                compiler_cl,
+                "/nologo",
+                "/O2",
+                "/DUNICODE",
+                "/D_UNICODE",
+                f"/Fe:{temp_exe}",
+                str(temp_source),
+                str(resource_file),
+                "shell32.lib",
+                "user32.lib",
+                "/link",
+                "/SUBSYSTEM:WINDOWS",
+            ]
+        else:
+            resource_file = _compile_launcher_resource_with_windres(windres_exe, temp_rc, temp_res_obj)  # type: ignore[arg-type]
+            command = [
+                compiler_gcc,  # type: ignore[list-item]
+                "-O2",
+                "-municode",
+                "-mwindows",
+                "-o",
+                str(temp_exe),
+                str(temp_source),
+                str(resource_file),
+                "-lshell32",
+                "-luser32",
+            ]
+
+        log("[INFO] Building lightweight launcher with icon resource...")
+        result = subprocess.run(command, cwd=str(temp_dir))
+        if result.returncode != 0 or not temp_exe.exists():
+            fail("Launcher build failed. cardbox-open.exe was not created.")
+        if not launcher_has_icon_resource(temp_exe):
+            fail("Launcher EXE was created without an icon resource. Build stopped.")
+        shutil.copy2(temp_exe, launcher_exe)
+        if not launcher_has_icon_resource(launcher_exe):
+            fail("Launcher EXE copy lost the icon resource. Build stopped.")
+        log(f"[INFO] Launcher icon resource verified: {launcher_exe}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     if copy_to_root:
         shutil.copy2(launcher_exe, LAUNCHER_ROOT_EXE)
