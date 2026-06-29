@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v16
+CardBox v17
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.2.1"
+APP_VERSION = "v1.3.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -92,6 +92,8 @@ DB_FILENAME = "cardbox.db"
 LEGACY_DB_FILENAME = "prompt_organizer.db"
 INTERNAL_MATERIAL_DRAG_MIME = "application/x-cardbox-material-drag"
 BACKUP_DIR_NAME = "_backup"
+ASSETS_BACKUP_DIR_SETTING_KEY = "assets_mirror_backup_dir"
+ASSETS_BACKUP_LAST_AT_SETTING_KEY = "last_assets_mirror_backup_at"
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico", ".svg", ".tif", ".tiff", ".tga"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
@@ -333,6 +335,7 @@ class Database:
                 pinned INTEGER NOT NULL DEFAULT 0,
                 parent_prompt_id INTEGER,
                 asset_bucket TEXT NOT NULL DEFAULT '',
+                asset_dirty_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(parent_prompt_id) REFERENCES prompts(id) ON DELETE SET NULL
@@ -343,6 +346,7 @@ class Database:
         self.ensure_column("prompts", "pinned", "INTEGER NOT NULL DEFAULT 0")
         self.ensure_column("prompts", "workspace_id", "INTEGER NOT NULL DEFAULT 1")
         self.ensure_column("prompts", "asset_bucket", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("prompts", "asset_dirty_at", "TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS tag_categories (
@@ -387,6 +391,8 @@ class Database:
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 caption TEXT NOT NULL DEFAULT '',
                 is_cover INTEGER NOT NULL DEFAULT 0,
+                file_mtime_ns INTEGER NOT NULL DEFAULT -1,
+                file_size INTEGER NOT NULL DEFAULT -1,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(prompt_id) REFERENCES prompts(id) ON DELETE CASCADE
             )
@@ -395,6 +401,8 @@ class Database:
         self.ensure_column("images", "media_type", "TEXT NOT NULL DEFAULT 'image'")
         self.ensure_column("images", "original_name", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("images", "label_id", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("images", "file_mtime_ns", "INTEGER NOT NULL DEFAULT -1")
+        self.ensure_column("images", "file_size", "INTEGER NOT NULL DEFAULT -1")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS tag_presets (
@@ -415,6 +423,21 @@ class Database:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_delete_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relative_path TEXT NOT NULL,
+                path_type TEXT NOT NULL DEFAULT 'file',
+                deleted_at TEXT NOT NULL,
+                UNIQUE(relative_path, path_type)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_prompts_updated_at ON prompts(updated_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_prompts_asset_dirty_at ON prompts(asset_dirty_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_images_prompt_id ON images(prompt_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_backup_delete_queue_deleted_at ON backup_delete_queue(deleted_at)")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS meta_options (
@@ -931,6 +954,42 @@ class Database:
         if commit:
             self.conn.commit()
 
+    def touch_prompt_asset(self, prompt_id: int, dirty_at: str | None = None, commit: bool = True) -> None:
+        dirty_at = dirty_at or self.now()
+        self.conn.execute("UPDATE prompts SET asset_dirty_at = ? WHERE id = ?", (dirty_at, int(prompt_id)))
+        if commit:
+            self.conn.commit()
+
+    def update_image_file_stats(self, updates: list[tuple[int, int, int]], dirty_prompt_id: int | None = None) -> None:
+        if not updates and dirty_prompt_id is None:
+            return
+        cur = self.conn.cursor()
+        for image_id, mtime_ns, file_size in updates:
+            cur.execute(
+                "UPDATE images SET file_mtime_ns = ?, file_size = ? WHERE id = ?",
+                (int(mtime_ns), int(file_size), int(image_id)),
+            )
+        if dirty_prompt_id is not None:
+            cur.execute("UPDATE prompts SET asset_dirty_at = ? WHERE id = ?", (self.now(), int(dirty_prompt_id)))
+        self.conn.commit()
+
+    def queue_backup_delete(self, relative_path: object, path_type: str = "file", commit: bool = True) -> None:
+        rel = normalize_backup_relative_path(relative_path)
+        if not rel:
+            return
+        path_type = "dir" if str(path_type) == "dir" else "file"
+        now = self.now()
+        self.conn.execute(
+            """
+            INSERT INTO backup_delete_queue(relative_path, path_type, deleted_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(relative_path, path_type) DO UPDATE SET deleted_at = excluded.deleted_at
+            """,
+            (rel, path_type, now),
+        )
+        if commit:
+            self.conn.commit()
+
     def set_prompt_pinned(self, prompt_id: int, pinned: bool) -> None:
         self.conn.execute("UPDATE prompts SET pinned = ? WHERE id = ?", (1 if pinned else 0, prompt_id))
         self.conn.commit()
@@ -1067,6 +1126,8 @@ class Database:
         is_cover: int = 0,
         media_type: str = "image",
         original_name: str = "",
+        file_mtime_ns: int = -1,
+        file_size: int = -1,
     ) -> int:
         cur = self.conn.cursor()
         max_sort = cur.execute("SELECT COALESCE(MAX(sort_order), -1) AS max_sort FROM images WHERE prompt_id = ?", (prompt_id,)).fetchone()["max_sort"]
@@ -1075,10 +1136,22 @@ class Database:
             is_cover = 1
         cur.execute(
             """
-            INSERT INTO images(prompt_id, file_path, thumbnail_path, sort_order, caption, is_cover, created_at, media_type, original_name)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO images(prompt_id, file_path, thumbnail_path, sort_order, caption, is_cover, file_mtime_ns, file_size, created_at, media_type, original_name)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (prompt_id, file_path, thumbnail_path, int(max_sort) + 1, caption, is_cover, self.now(), media_type, original_name),
+            (
+                prompt_id,
+                file_path,
+                thumbnail_path,
+                int(max_sort) + 1,
+                caption,
+                is_cover,
+                int(file_mtime_ns),
+                int(file_size),
+                self.now(),
+                media_type,
+                original_name,
+            ),
         )
         self.touch_prompt(prompt_id, commit=False)
         self.conn.commit()
@@ -1088,11 +1161,17 @@ class Database:
         self.conn.execute("UPDATE images SET thumbnail_path = ? WHERE id = ?", (thumbnail_path, image_id))
         self.conn.commit()
 
-    def update_image_file_path(self, image_id: int, file_path: str, touch: bool = True) -> None:
+    def update_image_file_path(self, image_id: int, file_path: str, touch: bool = True, file_mtime_ns: int | None = None, file_size: int | None = None) -> None:
         row = self.get_image(image_id)
         if not row:
             return
-        self.conn.execute("UPDATE images SET file_path = ? WHERE id = ?", (file_path, image_id))
+        if file_mtime_ns is None or file_size is None:
+            self.conn.execute("UPDATE images SET file_path = ? WHERE id = ?", (file_path, image_id))
+        else:
+            self.conn.execute(
+                "UPDATE images SET file_path = ?, file_mtime_ns = ?, file_size = ? WHERE id = ?",
+                (file_path, int(file_mtime_ns), int(file_size), image_id),
+            )
         if touch:
             self.touch_prompt(int(row["prompt_id"]), commit=False)
         self.conn.commit()
@@ -1106,7 +1185,7 @@ class Database:
         self.touch_prompt(int(row["prompt_id"]), commit=False)
         self.conn.commit()
 
-    def move_image_to_prompt(self, image_id: int, target_prompt_id: int, file_path: str, thumbnail_path: str) -> None:
+    def move_image_to_prompt(self, image_id: int, target_prompt_id: int, file_path: str, thumbnail_path: str, file_mtime_ns: int = -1, file_size: int = -1) -> None:
         row = self.get_image(image_id)
         if not row:
             return
@@ -1119,10 +1198,10 @@ class Database:
         cur.execute(
             """
             UPDATE images
-            SET prompt_id = ?, file_path = ?, thumbnail_path = ?, sort_order = ?, is_cover = ?
+            SET prompt_id = ?, file_path = ?, thumbnail_path = ?, sort_order = ?, is_cover = ?, file_mtime_ns = ?, file_size = ?
             WHERE id = ?
             """,
-            (target_prompt_id, file_path, thumbnail_path, int(max_sort) + 1, is_cover, image_id),
+            (target_prompt_id, file_path, thumbnail_path, int(max_sort) + 1, is_cover, int(file_mtime_ns), int(file_size), image_id),
         )
         if source_prompt_id != target_prompt_id:
             has_cover = cur.execute(
@@ -3661,6 +3740,7 @@ class WorkspaceDeleteWorker(QObject):
         fallback_workspace_id: int,
         active_workspace_id: int,
         asset_target_paths: list[str],
+        base_dir: str = "",
     ):
         super().__init__()
         self.db_path = db_path
@@ -3669,6 +3749,7 @@ class WorkspaceDeleteWorker(QObject):
         self.fallback_workspace_id = int(fallback_workspace_id)
         self.active_workspace_id = int(active_workspace_id)
         self.asset_target_paths = [Path(path) for path in asset_target_paths]
+        self.base_dir = Path(base_dir) if base_dir else Path()
 
     def run(self) -> None:
         result = {
@@ -3694,6 +3775,17 @@ class WorkspaceDeleteWorker(QObject):
 
             self.progress.emit(25, "DBからワークスペースを削除中...")
             conn.execute("BEGIN IMMEDIATE")
+            for asset_path in self.asset_target_paths:
+                rel = app_relative_path(asset_path, self.base_dir) if self.base_dir else ""
+                if rel and rel.startswith("assets/"):
+                    conn.execute(
+                        """
+                        INSERT INTO backup_delete_queue(relative_path, path_type, deleted_at)
+                        VALUES(?, 'dir', ?)
+                        ON CONFLICT(relative_path, path_type) DO UPDATE SET deleted_at = excluded.deleted_at
+                        """,
+                        (rel, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    )
             workspace_row = conn.execute("SELECT id FROM workspaces WHERE id = ?", (self.workspace_id,)).fetchone()
             if workspace_row is None:
                 raise RuntimeError("削除対象ワークスペースが見つかりません。")
@@ -3925,6 +4017,225 @@ class WorkspaceManagerDialog(QDialog):
         parent.delete_workspace_with_confirmation(int(self.current_workspace_id), self)
 
 
+class AssetBackupWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(bool, str, object)
+
+    def __init__(self, db_path: str, base_dir: str, assets_dir: str, mirror_dir: str, last_backup_at: str):
+        super().__init__()
+        self.db_path = db_path
+        self.base_dir = Path(base_dir)
+        self.assets_dir = Path(assets_dir)
+        self.mirror_dir = Path(mirror_dir)
+        self.last_backup_at = str(last_backup_at or "")
+
+    def prompt_asset_dir_from_row(self, row: sqlite3.Row) -> Path:
+        prompt_id = int(row["id"])
+        bucket = normalize_asset_bucket(row["asset_bucket"] if "asset_bucket" in row.keys() else "")
+        prompt_folder = f"prompt_{prompt_id:06d}"
+        if bucket:
+            return self.assets_dir.joinpath(*bucket.split("/")) / prompt_folder
+        return self.assets_dir / prompt_folder
+
+    def mirror_target_for_source(self, source_path: Path) -> Path | None:
+        rel = app_relative_path(source_path, self.base_dir)
+        if not rel:
+            return None
+        return self.mirror_dir.joinpath(*PureWindowsPath(rel).parts)
+
+    def stored_path_to_absolute(self, value: object) -> Path:
+        raw = str(value or "").strip()
+        if not raw:
+            return Path()
+        path = Path(raw)
+        if path.is_absolute():
+            return path
+        try:
+            win_path = PureWindowsPath(raw)
+            if win_path.is_absolute():
+                return Path(raw)
+            if "\\" in raw:
+                return self.base_dir.joinpath(*win_path.parts)
+        except Exception:
+            pass
+        return self.base_dir / path
+
+    def update_prompt_file_stats(self, conn: sqlite3.Connection, prompt_id: int) -> None:
+        rows = conn.execute("SELECT id, file_path FROM images WHERE prompt_id = ? ORDER BY id ASC", (int(prompt_id),)).fetchall()
+        for row in rows:
+            path = self.stored_path_to_absolute(row["file_path"])
+            mtime_ns, file_size = file_stat_values(path)
+            if mtime_ns < 0 or file_size < 0:
+                continue
+            conn.execute(
+                "UPDATE images SET file_mtime_ns = ?, file_size = ? WHERE id = ?",
+                (mtime_ns, file_size, int(row["id"])),
+            )
+
+    def copy_file_if_needed(self, src: Path, dest: Path) -> bool:
+        src_stat = src.stat()
+        if dest.exists() and dest.is_file():
+            try:
+                dest_stat = dest.stat()
+                if int(src_stat.st_size) == int(dest_stat.st_size) and int(src_stat.st_mtime_ns) == int(dest_stat.st_mtime_ns):
+                    return False
+            except Exception:
+                pass
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        copied_stat = dest.stat()
+        if int(copied_stat.st_size) != int(src_stat.st_size):
+            raise RuntimeError(f"コピー後のサイズが一致しません: {src}")
+        return True
+
+    def mirror_prompt_dir(self, src_dir: Path, dest_dir: Path) -> tuple[int, int, int, list[str]]:
+        copied = 0
+        deleted = 0
+        skipped = 0
+        errors: list[str] = []
+        if not src_dir.exists():
+            if dest_dir.exists():
+                moved, move_errors = move_paths_to_recycle_bin([dest_dir])
+                deleted += moved
+                errors.extend(move_errors)
+            return copied, deleted, skipped, errors
+
+        source_files: dict[str, Path] = {}
+        for src in src_dir.rglob("*"):
+            if src.is_file():
+                try:
+                    rel = src.relative_to(src_dir).as_posix()
+                except Exception:
+                    continue
+                source_files[rel] = src
+
+        for rel, src in source_files.items():
+            dest = dest_dir.joinpath(*PureWindowsPath(rel).parts)
+            try:
+                if self.copy_file_if_needed(src, dest):
+                    copied += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                errors.append(f"copy: {src} -> {dest}: {exc}")
+
+        if dest_dir.exists():
+            source_keys = set(source_files.keys())
+            extra_paths: list[Path] = []
+            for dest_child in dest_dir.rglob("*"):
+                if not dest_child.exists() or not dest_child.is_file():
+                    continue
+                try:
+                    rel = dest_child.relative_to(dest_dir).as_posix()
+                except Exception:
+                    continue
+                if rel not in source_keys:
+                    extra_paths.append(dest_child)
+            extra_paths.sort(key=lambda p: len(p.parts), reverse=True)
+            if extra_paths:
+                moved, move_errors = move_paths_to_recycle_bin(extra_paths)
+                deleted += moved
+                errors.extend(move_errors)
+            remove_empty_dirs(dest_dir)
+            if source_files:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+        return copied, deleted, skipped, errors
+
+    def run(self) -> None:
+        result = {"copied": 0, "deleted": 0, "skipped": 0, "prompt_count": 0, "delete_count": 0, "errors": []}
+        conn: sqlite3.Connection | None = None
+        try:
+            self.progress.emit(1, "assetsバックアップを準備中...")
+            self.mirror_dir.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            last = self.last_backup_at
+            prompt_rows = conn.execute(
+                """
+                SELECT id, asset_bucket, updated_at, asset_dirty_at
+                FROM prompts
+                WHERE updated_at > ? OR COALESCE(asset_dirty_at, '') > ?
+                ORDER BY id ASC
+                """,
+                (last, last),
+            ).fetchall()
+            delete_rows = conn.execute(
+                "SELECT id, relative_path, path_type FROM backup_delete_queue ORDER BY deleted_at ASC, id ASC"
+            ).fetchall()
+            result["prompt_count"] = len(prompt_rows)
+            result["delete_count"] = len(delete_rows)
+            total_units = max(1, len(prompt_rows) + len(delete_rows))
+            done_units = 0
+            processed_delete_ids: list[int] = []
+
+            for row in delete_rows:
+                rel = normalize_backup_relative_path(row["relative_path"])
+                if not rel:
+                    processed_delete_ids.append(int(row["id"]))
+                    done_units += 1
+                    continue
+                dest = self.mirror_dir.joinpath(*PureWindowsPath(rel).parts)
+                try:
+                    if dest.exists():
+                        moved, move_errors = move_paths_to_recycle_bin([dest])
+                        result["deleted"] += moved
+                        if move_errors:
+                            result["errors"].extend(move_errors)
+                        else:
+                            processed_delete_ids.append(int(row["id"]))
+                    else:
+                        processed_delete_ids.append(int(row["id"]))
+                except Exception as exc:
+                    result["errors"].append(f"delete: {dest}: {exc}")
+                done_units += 1
+                self.progress.emit(int(done_units / total_units * 90) + 5, f"削除同期中... {done_units}/{total_units}")
+
+            for row in prompt_rows:
+                prompt_id = int(row["id"])
+                src_dir = self.prompt_asset_dir_from_row(row)
+                dest_dir = self.mirror_target_for_source(src_dir)
+                if dest_dir is None:
+                    result["errors"].append(f"mirror target error: {src_dir}")
+                else:
+                    c, d, sk, errs = self.mirror_prompt_dir(src_dir, dest_dir)
+                    result["copied"] += c
+                    result["deleted"] += d
+                    result["skipped"] += sk
+                    result["errors"].extend(errs)
+                    self.update_prompt_file_stats(conn, prompt_id)
+                done_units += 1
+                self.progress.emit(int(done_units / total_units * 90) + 5, f"カードassets同期中... prompt_{prompt_id:06d} ({done_units}/{total_units})")
+
+            if processed_delete_ids:
+                placeholders = ",".join("?" for _ in processed_delete_ids)
+                conn.execute(f"DELETE FROM backup_delete_queue WHERE id IN ({placeholders})", processed_delete_ids)
+                conn.commit()
+
+            errors = result["errors"]
+            if errors:
+                self.finished.emit(False, "assetsバックアップに一部失敗しました。", result)
+                return
+
+            backup_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (ASSETS_BACKUP_LAST_AT_SETTING_KEY, backup_at),
+            )
+            conn.commit()
+            self.progress.emit(100, "assetsバックアップ完了")
+            self.finished.emit(True, "assetsバックアップが完了しました。", result)
+        except Exception as exc:
+            result["errors"].append(str(exc))
+            self.finished.emit(False, "assetsバックアップに失敗しました。", result)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4113,6 +4424,146 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "バックアップ失敗", "バックアップ対象のDBが見つかりませんでした。")
         except Exception as exc:
             QMessageBox.warning(self, "バックアップ失敗", f"DBをバックアップできませんでした。\n\n{exc}")
+
+
+    def assets_backup_dir(self) -> Path | None:
+        raw = self.db.get_setting(ASSETS_BACKUP_DIR_SETTING_KEY, "").strip()
+        if not raw:
+            return None
+        return Path(raw)
+
+    def validate_assets_backup_dir(self, directory: Path) -> tuple[bool, str]:
+        try:
+            directory = Path(directory)
+            resolved = directory.resolve()
+            assets_resolved = self.assets_dir.resolve()
+            if resolved == assets_resolved or is_relative_to_path(resolved, assets_resolved):
+                return False, "assetsフォルダ自身、またはassets配下はバックアップ先にできません。"
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    def choose_assets_backup_dir(self) -> Path | None:
+        current = self.assets_backup_dir() or self.base_dir
+        selected = QFileDialog.getExistingDirectory(self, "assetsミラーバックアップ先を選択", str(current))
+        if not selected:
+            return None
+        path = Path(selected)
+        ok, message = self.validate_assets_backup_dir(path)
+        if not ok:
+            QMessageBox.warning(self, "assetsバックアップ先", message)
+            return None
+        self.db.set_setting(ASSETS_BACKUP_DIR_SETTING_KEY, str(path))
+        return path
+
+    def set_assets_backup_dir(self) -> None:
+        path = self.choose_assets_backup_dir()
+        if path is not None:
+            QMessageBox.information(self, "assetsバックアップ先", f"assetsバックアップ先を設定しました。\n{path}")
+
+    def open_assets_backup_dir(self) -> None:
+        path = self.assets_backup_dir()
+        if path is None:
+            path = self.choose_assets_backup_dir()
+        if path is None:
+            return
+        path.mkdir(parents=True, exist_ok=True)
+        open_path(path)
+
+    def run_assets_mirror_backup(self) -> None:
+        if getattr(self, "_asset_backup_thread", None) is not None:
+            QMessageBox.information(self, "assetsバックアップ", "assetsバックアップは実行中です。")
+            return
+        try:
+            if self.dirty:
+                self.save_current_prompt()
+            if self.current_prompt_id is not None:
+                assets_changed = self.sync_current_prompt_assets()
+                if assets_changed:
+                    self.update_current_prompt_row_in_visible_list_in_place()
+            mirror_dir = self.assets_backup_dir()
+            if mirror_dir is None:
+                mirror_dir = self.choose_assets_backup_dir()
+            if mirror_dir is None:
+                return
+            ok, message = self.validate_assets_backup_dir(mirror_dir)
+            if not ok:
+                QMessageBox.warning(self, "assetsバックアップ", message)
+                return
+            self.db.conn.commit()
+        except Exception as exc:
+            QMessageBox.warning(self, "assetsバックアップ", f"assetsバックアップを開始できませんでした。\n\n{exc}")
+            return
+
+        last_backup_at = self.db.get_setting(ASSETS_BACKUP_LAST_AT_SETTING_KEY, "")
+        progress = QProgressDialog("assetsバックアップを実行中...", "", 0, 100, self)
+        progress.setWindowTitle("assetsバックアップ")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.setLabelText("準備中...")
+        progress.show()
+        QApplication.processEvents()
+
+        thread = QThread(self)
+        worker = AssetBackupWorker(str(self.db_path), str(self.base_dir), str(self.assets_dir), str(mirror_dir), last_backup_at)
+        worker.moveToThread(thread)
+        self._asset_backup_thread = thread
+        self._asset_backup_worker = worker
+        self._asset_backup_progress = progress
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.on_assets_backup_progress, Qt.QueuedConnection)
+        worker.finished.connect(self.on_assets_backup_finished, Qt.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_asset_backup_thread", None))
+        QTimer.singleShot(0, thread.start)
+
+    def on_assets_backup_progress(self, value: int, message: str) -> None:
+        progress = getattr(self, "_asset_backup_progress", None)
+        if progress is None:
+            return
+        try:
+            progress.setValue(max(0, min(100, int(value))))
+            progress.setLabelText(str(message))
+        except RuntimeError:
+            pass
+
+    def on_assets_backup_finished(self, success: bool, message: str, result: object) -> None:
+        progress = getattr(self, "_asset_backup_progress", None)
+        if progress is not None:
+            try:
+                progress.close()
+            except RuntimeError:
+                pass
+        info = result if isinstance(result, dict) else {}
+        errors = list(info.get("errors", [])) if isinstance(info, dict) else []
+        copied = int(info.get("copied", 0)) if isinstance(info, dict) else 0
+        deleted = int(info.get("deleted", 0)) if isinstance(info, dict) else 0
+        skipped = int(info.get("skipped", 0)) if isinstance(info, dict) else 0
+        prompts = int(info.get("prompt_count", 0)) if isinstance(info, dict) else 0
+        deletes = int(info.get("delete_count", 0)) if isinstance(info, dict) else 0
+        summary = f"対象カード: {prompts} 件\n削除同期: {deletes} 件\nコピー/更新: {copied} 件\n削除: {deleted} 件\nスキップ: {skipped} 件"
+        if success:
+            QMessageBox.information(self, "assetsバックアップ", f"{message}\n\n{summary}")
+            self.statusBar().showMessage(f"assetsバックアップ完了: コピー/更新 {copied} 件、削除 {deleted} 件")
+        else:
+            extra = ""
+            if errors:
+                extra = "\n\nエラー:\n" + "\n".join(str(err) for err in errors[:8])
+                if len(errors) > 8:
+                    extra += f"\n...ほか {len(errors) - 8} 件"
+            QMessageBox.warning(self, "assetsバックアップ", f"{message}\n\n{summary}{extra}")
+            self.statusBar().showMessage("assetsバックアップに失敗/警告があります")
+        thread = getattr(self, "_asset_backup_thread", None)
+        self._asset_backup_worker = None
+        self._asset_backup_progress = None
+        if thread is not None:
+            try:
+                thread.quit()
+            except RuntimeError:
+                pass
 
 
     def build_workspace_delete_plan(self, workspace_id: int) -> WorkspaceDeletePlan:
@@ -4309,6 +4760,7 @@ class MainWindow(QMainWindow):
             plan.fallback_workspace_id,
             self.current_workspace_id,
             [str(path) for path in plan.asset_target_paths],
+            str(self.base_dir),
         )
         worker.moveToThread(thread)
         self._workspace_delete_thread = thread
@@ -4357,11 +4809,6 @@ class MainWindow(QMainWindow):
         info = result if isinstance(result, dict) else {}
         db_deleted = bool(info.get("db_deleted"))
         if db_deleted:
-            try:
-                self.db.close()
-            except Exception:
-                pass
-            self.db = Database(self.db_path)
             self.current_workspace_id = self.db.current_workspace_id()
             self.clear_detail()
             self.refresh_workspace_selector()
@@ -4443,6 +4890,12 @@ class MainWindow(QMainWindow):
         file_dir.mkdir(parents=True, exist_ok=True)
         thumb_dir.mkdir(parents=True, exist_ok=True)
         return image_dir, file_dir, thumb_dir
+
+    def queue_backup_delete_path(self, path: Path, path_type: str = "file") -> None:
+        rel = app_relative_path(Path(path), self.base_dir)
+        if not rel or not rel.startswith("assets/"):
+            return
+        self.db.queue_backup_delete(rel, path_type=path_type, commit=False)
 
     def stored_path_to_absolute(self, value: object) -> Path:
         raw = str(value or "").strip()
@@ -4949,18 +5402,27 @@ class MainWindow(QMainWindow):
     def build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
         open_assets_action = QAction("メディアフォルダを開く", self)
-        backup_action = QAction("バックアップ実行", self)
-        open_backup_action = QAction("バックアップフォルダを開く", self)
+        backup_action = QAction("DBバックアップ実行", self)
+        open_backup_action = QAction("DBバックアップフォルダを開く", self)
+        set_assets_backup_action = QAction("assetsバックアップ先を設定...", self)
+        open_assets_backup_action = QAction("assetsバックアップ先を開く", self)
+        assets_backup_action = QAction("assetsミラーバックアップ実行", self)
         quit_action = QAction("終了", self)
         quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         open_assets_action.triggered.connect(self.open_assets_folder)
         backup_action.triggered.connect(self.run_manual_backup)
         open_backup_action.triggered.connect(self.open_backup_folder)
+        set_assets_backup_action.triggered.connect(self.set_assets_backup_dir)
+        open_assets_backup_action.triggered.connect(self.open_assets_backup_dir)
+        assets_backup_action.triggered.connect(self.run_assets_mirror_backup)
         quit_action.triggered.connect(self.request_quit_app)
         file_menu.addAction(open_assets_action)
         file_menu.addAction(open_backup_action)
+        file_menu.addAction(open_assets_backup_action)
         file_menu.addSeparator()
         file_menu.addAction(backup_action)
+        file_menu.addAction(set_assets_backup_action)
+        file_menu.addAction(assets_backup_action)
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
 
@@ -6283,13 +6745,16 @@ class MainWindow(QMainWindow):
         recycle_targets: list[Path] = []
         if prompt_asset_dir.exists():
             recycle_targets.append(prompt_asset_dir)
+            self.queue_backup_delete_path(prompt_asset_dir, "dir")
         for row in image_rows:
             file_path = self.material_file_path_from_row(row)
             thumb_path = self.material_thumb_path_from_row(row)
             if file_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(file_path, prompt_asset_dir)):
                 recycle_targets.append(file_path)
+                self.queue_backup_delete_path(file_path, "file")
             if thumb_path and thumb_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(thumb_path, prompt_asset_dir)):
                 recycle_targets.append(thumb_path)
+                self.queue_backup_delete_path(thumb_path, "file")
 
         self.db.delete_prompt(deleted_id)
         moved, errors = move_paths_to_recycle_bin(recycle_targets)
@@ -6509,6 +6974,8 @@ class MainWindow(QMainWindow):
                     caption=caption,
                     media_type=media_type,
                     original_name=original_name or src_path.name,
+                    file_mtime_ns=file_stat_values(dest_path)[0],
+                    file_size=file_stat_values(dest_path)[1],
                 )
                 thumb_path = self.create_material_thumbnail(dest_path, new_image_id, target_prompt_id, media_type)
                 if thumb_path:
@@ -6522,7 +6989,8 @@ class MainWindow(QMainWindow):
                     shutil.move(str(src_path), str(dest_path))
                 thumb_path = self.create_material_thumbnail(dest_path, image_id, target_prompt_id, media_type)
                 new_thumb_path = self.absolute_path_to_stored(thumb_path) if thumb_path else ""
-                self.db.move_image_to_prompt(image_id, target_prompt_id, self.absolute_path_to_stored(dest_path), new_thumb_path)
+                mtime_ns, file_size = file_stat_values(dest_path)
+                self.db.move_image_to_prompt(image_id, target_prompt_id, self.absolute_path_to_stored(dest_path), new_thumb_path, mtime_ns, file_size)
                 if old_thumb_path and old_thumb_path.exists() and (not thumb_path or old_thumb_path.resolve() != thumb_path.resolve()):
                     try:
                         old_thumb_path.unlink()
@@ -6568,12 +7036,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "メディア貼り付けエラー", "クリップボード画像をPNGとして保存できませんでした。")
             return False
 
+        mtime_ns, file_size = file_stat_values(dest)
         image_id = self.db.add_image(
             self.current_prompt_id,
             self.absolute_path_to_stored(dest),
             "",
             media_type="image",
             original_name="clipboard.png",
+            file_mtime_ns=mtime_ns,
+            file_size=file_size,
         )
         thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
         if thumb_path:
@@ -6624,7 +7095,8 @@ class MainWindow(QMainWindow):
                     dest = unique_path(prompt_image_dir / safe_filename(src.name))
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
-                    image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="image", original_name=src.name)
+                    mtime_ns, file_size = file_stat_values(dest)
+                    image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="image", original_name=src.name, file_mtime_ns=mtime_ns, file_size=file_size)
                     thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
                     if thumb_path:
                         self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
@@ -6643,7 +7115,8 @@ class MainWindow(QMainWindow):
                         dest = unique_path(prompt_file_dir / safe_filename(src.name))
                         if src.resolve() != dest.resolve():
                             shutil.copy2(src, dest)
-                        image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="video", original_name=src.name)
+                        mtime_ns, file_size = file_stat_values(dest)
+                        image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="video", original_name=src.name, file_mtime_ns=mtime_ns, file_size=file_size)
                         thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "video")
                         if not thumb_path:
                             thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, media_type_for_path(dest))
@@ -6651,7 +7124,8 @@ class MainWindow(QMainWindow):
                             self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                     else:
                         dest = self.generate_video_snapshot(src, prompt_image_dir)
-                        image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="image", original_name=src.name)
+                        mtime_ns, file_size = file_stat_values(dest)
+                        image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="image", original_name=src.name, file_mtime_ns=mtime_ns, file_size=file_size)
                         thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
                         if thumb_path:
                             self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
@@ -6661,7 +7135,8 @@ class MainWindow(QMainWindow):
                     dest = unique_path(prompt_file_dir / safe_filename(src.name))
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
-                    image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type=media_type_for_path(src), original_name=src.name)
+                    mtime_ns, file_size = file_stat_values(dest)
+                    image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type=media_type_for_path(src), original_name=src.name, file_mtime_ns=mtime_ns, file_size=file_size)
                     thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, media_type_for_path(dest))
                     if thumb_path:
                         self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
@@ -6952,6 +7427,8 @@ class MainWindow(QMainWindow):
         changed = False
         recycle_targets: list[Path] = []
         registered: set[str] = set()
+        stat_updates: list[tuple[int, int, int]] = []
+        asset_stat_dirty = False
 
         for row in self.db.list_images(prompt_id):
             image_id = int(row["id"])
@@ -6960,10 +7437,21 @@ class MainWindow(QMainWindow):
                 thumb_path = self.material_thumb_path_from_row(row)
                 if thumb_path and thumb_path.exists():
                     recycle_targets.append(thumb_path)
+                    self.queue_backup_delete_path(thumb_path, "file")
+                self.queue_backup_delete_path(file_path, "file")
                 self.db.delete_image(image_id)
                 changed = True
                 continue
             registered.add(material_path_key(file_path))
+            current_mtime_ns, current_file_size = file_stat_values(file_path)
+            old_mtime_ns = safe_int(row["file_mtime_ns"] if "file_mtime_ns" in row.keys() else -1, -1)
+            old_file_size = safe_int(row["file_size"] if "file_size" in row.keys() else -1, -1)
+            if current_mtime_ns >= 0 and current_file_size >= 0:
+                if old_mtime_ns < 0 or old_file_size < 0:
+                    stat_updates.append((image_id, current_mtime_ns, current_file_size))
+                elif old_mtime_ns != current_mtime_ns or old_file_size != current_file_size:
+                    stat_updates.append((image_id, current_mtime_ns, current_file_size))
+                    asset_stat_dirty = True
             thumb_path = self.material_thumb_path_from_row(row)
             if not thumb_path or not thumb_path.exists():
                 media_type = str(row["media_type"] if "media_type" in row.keys() else media_type_for_path(file_path))
@@ -6974,6 +7462,11 @@ class MainWindow(QMainWindow):
                         changed = True
                 except Exception:
                     pass
+
+        if stat_updates:
+            self.db.update_image_file_stats(stat_updates, dirty_prompt_id=prompt_id if asset_stat_dirty else None)
+            if asset_stat_dirty:
+                changed = True
 
         if recycle_targets:
             move_paths_to_recycle_bin(recycle_targets)
@@ -6991,7 +7484,8 @@ class MainWindow(QMainWindow):
                     invalid_image_files.append(child.name)
                 continue
             try:
-                image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type="image", original_name=child.name)
+                mtime_ns, file_size = file_stat_values(child)
+                image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type="image", original_name=child.name, file_mtime_ns=mtime_ns, file_size=file_size)
                 thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, "image")
                 if thumb_path:
                     self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
@@ -7007,12 +7501,14 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 if child.suffix.lower() in SUPPORTED_VIDEO_EXTS:
-                    image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type="video", original_name=child.name)
+                    mtime_ns, file_size = file_stat_values(child)
+                    image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type="video", original_name=child.name, file_mtime_ns=mtime_ns, file_size=file_size)
                     thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, "video")
                     if not thumb_path:
                         thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, media_type_for_path(child))
                 else:
-                    image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type=media_type_for_path(child), original_name=child.name)
+                    mtime_ns, file_size = file_stat_values(child)
+                    image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type=media_type_for_path(child), original_name=child.name, file_mtime_ns=mtime_ns, file_size=file_size)
                     thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, media_type_for_path(child))
                 if thumb_path:
                     self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
@@ -7339,7 +7835,8 @@ class MainWindow(QMainWindow):
         new_path = unique_path(old_path.with_name(f"{new_stem}{old_path.suffix}"))
         try:
             old_path.rename(new_path)
-            self.db.update_image_file_path(image_id, self.absolute_path_to_stored(new_path))
+            mtime_ns, file_size = file_stat_values(new_path)
+            self.db.update_image_file_path(image_id, self.absolute_path_to_stored(new_path), file_mtime_ns=mtime_ns, file_size=file_size)
             self.refresh_images()
             self.update_current_prompt_row_in_visible_list_in_place()
             self.statusBar().showMessage(f"メディアファイル名を変更しました: {new_path.name}")
@@ -7363,10 +7860,13 @@ class MainWindow(QMainWindow):
         if result != QMessageBox.Yes:
             return
 
-        recycle_targets = [self.material_file_path_from_row(row)]
+        file_path = self.material_file_path_from_row(row)
+        recycle_targets = [file_path]
+        self.queue_backup_delete_path(file_path, "file")
         thumb_path = self.material_thumb_path_from_row(row)
         if thumb_path and thumb_path.exists():
             recycle_targets.append(thumb_path)
+            self.queue_backup_delete_path(thumb_path, "file")
 
         prompt_id = int(row["prompt_id"])
         prompt_asset_dir = self.prompt_asset_dir(prompt_id)
@@ -7374,6 +7874,7 @@ class MainWindow(QMainWindow):
         if not self.db.list_images(prompt_id):
             if prompt_asset_dir.exists():
                 recycle_targets = [prompt_asset_dir]
+                self.queue_backup_delete_path(prompt_asset_dir, "dir")
         moved, errors = move_paths_to_recycle_bin(recycle_targets)
         remove_empty_dirs(prompt_asset_dir)
         self.cleanup_empty_asset_parents_for_path(prompt_asset_dir)
@@ -8148,6 +8649,40 @@ def format_file_size(size: int) -> str:
                 return f"{int(value)} {unit}"
             return f"{value:.1f} {unit}"
         value /= 1024
+
+
+def file_stat_values(path: Path) -> tuple[int, int]:
+    try:
+        stat = Path(path).stat()
+        return int(stat.st_mtime_ns), int(stat.st_size)
+    except Exception:
+        return -1, -1
+
+
+def app_relative_path(path: Path, base_dir: Path) -> str:
+    try:
+        return Path(path).resolve().relative_to(Path(base_dir).resolve()).as_posix()
+    except Exception:
+        return ""
+
+
+def normalize_backup_relative_path(value: object) -> str:
+    raw = str(value or "").replace("\\", "/").strip().strip("/")
+    if not raw:
+        return ""
+    parts = []
+    for part in raw.split("/"):
+        part = part.strip()
+        if not part or part in {".", ".."}:
+            return ""
+        parts.append(part)
+    rel = "/".join(parts)
+    try:
+        if Path(rel).is_absolute() or PureWindowsPath(rel).is_absolute():
+            return ""
+    except Exception:
+        return ""
+    return rel
 
 
 def material_path_key(path: Path) -> str:
