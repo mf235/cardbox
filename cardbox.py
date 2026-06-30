@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v18
+CardBox v19
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.3.1"
+APP_VERSION = "v1.4.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -94,6 +94,7 @@ INTERNAL_MATERIAL_DRAG_MIME = "application/x-cardbox-material-drag"
 BACKUP_DIR_NAME = "_backup"
 ASSETS_BACKUP_DIR_SETTING_KEY = "assets_mirror_backup_dir"
 ASSETS_BACKUP_LAST_AT_SETTING_KEY = "last_assets_mirror_backup_at"
+EXTERNAL_EDITORS_SETTING_KEY = "external_editors_json"
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico", ".svg", ".tif", ".tiff", ".tga"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
@@ -272,6 +273,58 @@ class PromptRow:
     updated_at: str
 
 
+
+
+
+
+@dataclass
+class ExternalEditorEntry:
+    index: int
+    name: str
+    path: str
+
+    @property
+    def registered(self) -> bool:
+        return bool(self.name.strip() and self.path.strip())
+
+
+def normalize_external_editor_entries(raw: object) -> list[ExternalEditorEntry]:
+    data: object
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw) if raw.strip() else []
+        except Exception:
+            data = []
+    else:
+        data = raw
+    if not isinstance(data, list):
+        data = []
+    by_index: dict[int, ExternalEditorEntry] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index", -1))
+        except Exception:
+            continue
+        if index < 0 or index > 9:
+            continue
+        name = str(item.get("name", "") or "").strip()
+        path = str(item.get("path", "") or "").strip().strip('"')
+        by_index[index] = ExternalEditorEntry(index=index, name=name, path=path)
+    return [by_index.get(index, ExternalEditorEntry(index=index, name="", path="")) for index in range(10)]
+
+
+def external_editor_entries_to_json(entries: list[ExternalEditorEntry]) -> str:
+    payload: list[dict[str, object]] = []
+    for entry in entries[:10]:
+        name = str(entry.name or "").strip()
+        path = str(entry.path or "").strip().strip('"')
+        if not name and not path:
+            continue
+        index = max(0, min(9, int(entry.index)))
+        payload.append({"index": index, "name": name, "path": path})
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 @dataclass
@@ -2013,6 +2066,12 @@ class ImageListWidget(QListWidget):
             self.main_window.open_selected_image()
             event.accept()
             return
+        if (modifiers & Qt.ControlModifier) and not (modifiers & (Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)):
+            key = event.key()
+            if Qt.Key_0 <= key <= Qt.Key_9:
+                self.main_window.launch_selected_material_editor(key - Qt.Key_0)
+                event.accept()
+                return
         if event.key() == Qt.Key_C and modifiers == Qt.ControlModifier:
             self.main_window.copy_selected_material_to_clipboard()
             event.accept()
@@ -3725,6 +3784,85 @@ class MaterialLabelManagerDialog(QDialog):
             self.db.set_setting(self.setting_key(label_id, "fg"), fg)
             self.db.set_setting(self.setting_key(label_id, "bg"), bg)
         self.accept()
+
+
+
+class ExternalEditorManagerDialog(QDialog):
+    def __init__(self, db: Database, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.db = db
+        self.name_edits: dict[int, QLineEdit] = {}
+        self.path_edits: dict[int, QLineEdit] = {}
+        self.setWindowTitle("エディタ管理")
+        self.resize(760, 360)
+        self.build_ui()
+        self.load_values()
+
+    def build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("素材右クリックメニューと Ctrl+数字 から起動する外部エディタを登録します。"))
+
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 3)
+        grid.addWidget(QLabel("No"), 0, 0)
+        grid.addWidget(QLabel("名前"), 0, 1)
+        grid.addWidget(QLabel("ファイル名"), 0, 2)
+
+        for index in range(10):
+            name_edit = QLineEdit()
+            path_edit = QLineEdit()
+            browse_button = QPushButton("参照")
+            self.name_edits[index] = name_edit
+            self.path_edits[index] = path_edit
+            grid.addWidget(QLabel(str(index)), index + 1, 0)
+            grid.addWidget(name_edit, index + 1, 1)
+            grid.addWidget(path_edit, index + 1, 2)
+            grid.addWidget(browse_button, index + 1, 3)
+            browse_button.clicked.connect(lambda checked=False, i=index: self.browse_editor(i))
+
+        root.addLayout(grid)
+
+        button_row = QHBoxLayout()
+        save_button = QPushButton("保存して閉じる")
+        close_button = QPushButton("閉じる")
+        save_button.clicked.connect(self.save_and_accept)
+        close_button.clicked.connect(self.reject)
+        button_row.addStretch(1)
+        button_row.addWidget(save_button)
+        button_row.addWidget(close_button)
+        root.addLayout(button_row)
+
+    def load_values(self) -> None:
+        entries = normalize_external_editor_entries(self.db.get_setting(EXTERNAL_EDITORS_SETTING_KEY, "[]"))
+        for entry in entries:
+            self.name_edits[entry.index].setText(entry.name)
+            self.path_edits[entry.index].setText(entry.path)
+
+    def browse_editor(self, index: int) -> None:
+        current = self.path_edits[index].text().strip().strip('"')
+        start_dir = str(Path(current).parent) if current else str(Path.home())
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "エディタを選択",
+            start_dir,
+            "実行ファイル (*.exe *.bat *.cmd);;すべてのファイル (*)",
+        )
+        if not path:
+            return
+        self.path_edits[index].setText(path)
+        if not self.name_edits[index].text().strip():
+            self.name_edits[index].setText(Path(path).stem)
+
+    def save_and_accept(self) -> None:
+        entries: list[ExternalEditorEntry] = []
+        for index in range(10):
+            name = self.name_edits[index].text().strip()
+            path = self.path_edits[index].text().strip().strip('"')
+            entries.append(ExternalEditorEntry(index=index, name=name, path=path))
+        self.db.set_setting(EXTERNAL_EDITORS_SETTING_KEY, external_editor_entries_to_json(entries))
+        self.accept()
+
 
 
 
@@ -5641,9 +5779,12 @@ class MainWindow(QMainWindow):
         tag_manage_action.triggered.connect(self.open_tag_manager)
         label_manage_action = QAction("ラベル管理", self)
         label_manage_action.triggered.connect(self.open_material_label_manager)
+        editor_manage_action = QAction("エディタ管理", self)
+        editor_manage_action.triggered.connect(self.open_external_editor_manager)
         settings_menu.addAction(workspace_manage_action)
         settings_menu.addAction(tag_manage_action)
         settings_menu.addAction(label_manage_action)
+        settings_menu.addAction(editor_manage_action)
         settings_menu.addSeparator()
 
         font_menu = settings_menu.addMenu("文字サイズ")
@@ -6930,6 +7071,51 @@ class MainWindow(QMainWindow):
             self.refresh_material_label_colors()
             self.statusBar().showMessage("ラベル設定を更新しました")
 
+    def load_external_editors(self) -> list[ExternalEditorEntry]:
+        return normalize_external_editor_entries(self.db.get_setting(EXTERNAL_EDITORS_SETTING_KEY, "[]"))
+
+    def registered_external_editors(self) -> list[ExternalEditorEntry]:
+        return [entry for entry in self.load_external_editors() if entry.registered]
+
+    def open_external_editor_manager(self) -> None:
+        dialog = ExternalEditorManagerDialog(self.db, self)
+        if dialog.exec():
+            self.statusBar().showMessage("エディタ設定を更新しました")
+
+    def launch_selected_material_editor(self, editor_index: int) -> None:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            self.statusBar().showMessage("エディタで開くメディアが選択されていません")
+            return
+        row = self.db.get_image(image_id)
+        if not row:
+            return
+        media_path = self.material_file_path_from_row(row)
+        if not media_path.exists():
+            QMessageBox.warning(self, "エディタ起動エラー", "メディアファイルが見つかりません。")
+            return
+        entries = self.load_external_editors()
+        if editor_index < 0 or editor_index >= len(entries):
+            return
+        editor = entries[editor_index]
+        if not editor.registered:
+            self.statusBar().showMessage(f"エディタ {editor_index} は未登録です")
+            return
+        editor_path = Path(editor.path).expanduser()
+        if not editor_path.exists() or not editor_path.is_file():
+            QMessageBox.warning(
+                self,
+                "エディタ起動エラー",
+                f"登録エディタが見つかりません。\nNo {editor.index}: {editor.name}\n{editor.path}",
+            )
+            return
+        try:
+            subprocess.Popen([str(editor_path), str(media_path)], cwd=str(editor_path.parent))
+        except Exception as exc:
+            QMessageBox.warning(self, "エディタ起動エラー", f"エディタを起動できませんでした。\n{exc}")
+            return
+        self.statusBar().showMessage(f"エディタで開きました: {editor.name} / {media_path.name}")
+
     def material_label_style(self, label_id: int) -> tuple[str, str] | None:
         label_id = max(0, min(9, int(label_id)))
         if label_id <= 0:
@@ -8043,8 +8229,19 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         open_action = menu.addAction("開く")
         reveal_action = menu.addAction("エクスプローラーで表示")
-        copy_action = menu.addAction("コピー")
+        editor_actions: dict[QAction, int] = {}
+        editors = self.registered_external_editors()
+        if editors:
+            menu.addSeparator()
+            for editor in editors:
+                action = QAction(editor.name, menu)
+                action.setShortcut(QKeySequence(f"Ctrl+{editor.index}"))
+                self.set_shortcut_visible_in_context_menu(action)
+                menu.addAction(action)
+                editor_actions[action] = editor.index
+            menu.addSeparator()
         add_new_card_action = menu.addAction("新規カードを作って追加")
+        copy_action = menu.addAction("コピー")
         rename_action = menu.addAction("ファイル名の変更")
         cover_action = menu.addAction("カバーにする")
         label_menu = menu.addMenu("ラベル")
@@ -8063,6 +8260,8 @@ class MainWindow(QMainWindow):
             self.open_selected_image()
         elif selected == reveal_action:
             self.reveal_selected_material_in_explorer()
+        elif selected in editor_actions:
+            self.launch_selected_material_editor(editor_actions[selected])
         elif selected == copy_action:
             self.copy_selected_material_to_clipboard()
         elif selected == add_new_card_action:
@@ -8374,6 +8573,7 @@ class MainWindow(QMainWindow):
             ("メディア 削除", "Del"),
             ("メディア ファイル名変更", "F2"),
             ("メディア ラベル設定", "0-9"),
+            ("メディア エディタ起動", "Ctrl+0〜9"),
             ("カード 削除", "Del"),
             ("画像ビュアー 前面表示", "Alt+Z"),
             ("画像ビュアー 並べて表示", "Alt+A"),
