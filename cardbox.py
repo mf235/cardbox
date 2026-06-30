@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CardBox v19
+CardBox v20
 
 カード型の情報を、タイトル・タグ・説明・メディア付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -76,7 +76,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "CardBox"
-APP_VERSION = "v1.4.0"
+APP_VERSION = "v1.4.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/cardbox"
@@ -7082,6 +7082,11 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             self.statusBar().showMessage("エディタ設定を更新しました")
 
+    def set_shortcut_visible_in_context_menu(self, action: QAction) -> None:
+        setter = getattr(action, "setShortcutVisibleInContextMenu", None)
+        if callable(setter):
+            setter(True)
+
     def launch_selected_material_editor(self, editor_index: int) -> None:
         image_id = self.selected_image_id()
         if image_id is None:
@@ -8230,7 +8235,11 @@ class MainWindow(QMainWindow):
         open_action = menu.addAction("開く")
         reveal_action = menu.addAction("エクスプローラーで表示")
         editor_actions: dict[QAction, int] = {}
-        editors = self.registered_external_editors()
+        try:
+            editors = self.registered_external_editors()
+        except Exception as exc:
+            editors = []
+            self.statusBar().showMessage(f"エディタ設定の読み込みに失敗しました: {exc}")
         if editors:
             menu.addSeparator()
             for editor in editors:
